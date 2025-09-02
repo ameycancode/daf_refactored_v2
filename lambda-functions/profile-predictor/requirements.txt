@@ -1,0 +1,26 @@
+    # Requirements for energy-forecasting-profile-predictor Lambda function
+# lambda-functions/profile-predictor/requirements.txt
+
+# Core data processing libraries
+pandas>=1.3.0,<2.0.0
+numpy>=1.21.0,<2.0.0
+
+# AWS SDK
+boto3>=1.26.0
+botocore>=1.29.0
+
+# HTTP requests for weather/radiation APIs
+requests>=2.32.4
+
+# Date/time handling
+pytz>=2021.1
+
+# Optional optimization libraries (comment out if package size is an issue)
+# scipy>=1.7.0  # For advanced statistical functions
+# scikit-learn>=1.0.0  # If needed for data preprocessing
+
+# Note: These are the minimal requirements to match container functionality
+# Total estimated package size: ~80MB with dependencies
+# Can be reduced to ~20MB using Lambda Layers for pandas/numpy
+
+aiohttp>=3.12.14

@@ -1,0 +1,5 @@
+{
+  "profiles": ["RNN", "RN", "M", "S", "AGR", "L", "A6"],
+  "model_type": "XGBoost",
+  "version": "1.0.0"
+}

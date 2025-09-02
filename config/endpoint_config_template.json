@@ -1,0 +1,16 @@
+{
+  "instance_types": {
+    "RNN": "ml.t2.medium",
+    "RN": "ml.t2.medium",
+    "M": "ml.t2.small",
+    "S": "ml.t2.small",
+    "AGR": "ml.t2.small",
+    "L": "ml.t2.micro",
+    "A6": "ml.t2.small"
+  },
+  "auto_scaling": {
+    "enabled": false,
+    "min_capacity": 1,
+    "max_capacity": 2
+  }
+}

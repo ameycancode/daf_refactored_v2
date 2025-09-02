@@ -1,0 +1,18 @@
+# Core AWS and Data Processing
+boto3>=1.26.0
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Date and Time Handling
+pytz>=2022.1
+
+# Visualization (if used in preprocessing)
+plotly>=5.10.0
+matplotlib>=3.5.0
+
+# Data Science Utilities
+scikit-learn>=1.1.0
+joblib>=1.1.0
+
+# Additional utilities that might be used
+requests>=2.28.0
