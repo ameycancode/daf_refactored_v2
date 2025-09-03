@@ -435,44 +435,52 @@ class EnhancedMLOpsDeployer:
             return False
     
     def _setup_enhanced_eventbridge(self) -> Dict[str, Any]:
-        """Setup enhanced EventBridge rules"""
-        
+        """Setup enhanced EventBridge rules for both prediction and training pipelines"""
+       
         try:
             # Create enhanced EventBridge rules
             sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'infrastructure'))
             from step_functions_definitions import create_enhanced_eventbridge_rules
-            
+           
             # Get state machine ARNs
             state_machines = self.stepfunctions_client.list_state_machines()
-            
+           
             enhanced_prediction_arn = None
+            training_pipeline_arn = None
+           
             for sm in state_machines['stateMachines']:
                 if sm['name'] == self.config['enhanced_prediction_state_machine']:
                     enhanced_prediction_arn = sm['stateMachineArn']
-                    break
-            
+                elif sm['name'] == self.config['training_state_machine']:
+                    training_pipeline_arn = sm['stateMachineArn']
+           
             if not enhanced_prediction_arn:
                 raise Exception("Enhanced prediction state machine not found")
-            
-            # Create EventBridge rules
+               
+            if not training_pipeline_arn:
+                raise Exception("Training pipeline state machine not found")
+           
+            # Create EventBridge rules for both pipelines
             state_machine_arns = {
-                'enhanced_prediction_pipeline': enhanced_prediction_arn
+                'enhanced_prediction_pipeline': enhanced_prediction_arn,
+                'training_pipeline': training_pipeline_arn
             }
-            
+           
             rules_result = create_enhanced_eventbridge_rules(
-                self.account_id, 
-                self.region, 
+                self.account_id,
+                self.region,
                 state_machine_arns
             )
-            
-            logger.info("✓ Enhanced EventBridge rules configured")
-            
+           
+            logger.info("✓ Enhanced EventBridge rules created successfully")
+           
             return {
                 'status': 'success',
                 'rules_created': rules_result,
-                'enhanced_prediction_arn': enhanced_prediction_arn
+                'enhanced_prediction_arn': enhanced_prediction_arn,
+                'training_pipeline_arn': training_pipeline_arn
             }
-            
+           
         except Exception as e:
             logger.error(f"Enhanced EventBridge setup failed: {str(e)}")
             return {
@@ -480,12 +488,64 @@ class EnhancedMLOpsDeployer:
                 'error': str(e)
             }
 
+    def manage_eventbridge_schedules(region: str, action: str = 'status'):
+        """
+        Manage EventBridge schedules - enable, disable, or check status
+       
+        Args:
+            region: AWS region
+            action: 'enable', 'disable', or 'status'
+        """
+       
+        events_client = boto3.client('events', region_name=region)
+       
+        rules = [
+            'energy-forecasting-enhanced-daily-predictions',
+            'energy-forecasting-monthly-training-pipeline'
+        ]
+       
+        results = {}
+       
+        for rule_name in rules:
+            try:
+                # Get current status
+                rule_info = events_client.describe_rule(Name=rule_name)
+                current_state = rule_info['State']
+               
+                if action == 'status':
+                    results[rule_name] = {
+                        'current_state': current_state,
+                        'schedule': rule_info.get('ScheduleExpression', 'No schedule'),
+                        'description': rule_info.get('Description', 'No description')
+                    }
+                   
+                elif action == 'enable':
+                    if current_state != 'ENABLED':
+                        events_client.enable_rule(Name=rule_name)
+                        results[rule_name] = f"Enabled (was {current_state})"
+                    else:
+                        results[rule_name] = "Already enabled"
+                       
+                elif action == 'disable':
+                    if current_state != 'DISABLED':
+                        events_client.disable_rule(Name=rule_name)
+                        results[rule_name] = f"Disabled (was {current_state})"
+                    else:
+                        results[rule_name] = "Already disabled"
+                       
+            except events_client.exceptions.ResourceNotFoundException:
+                results[rule_name] = "Rule not found"
+            except Exception as e:
+                results[rule_name] = f"Error: {str(e)}"
+       
+        return results
+
     def _validate_complete_deployment(self) -> Dict[str, Any]:
-        """Validate the complete enhanced deployment"""
-        
+        """Validate complete deployment including training schedules"""
+       
         try:
             validation_results = {}
-            
+           
             # Check Lambda functions
             lambda_functions = [
                 'energy-forecasting-profile-validator',
@@ -493,7 +553,7 @@ class EnhancedMLOpsDeployer:
                 'energy-forecasting-profile-predictor',
                 'energy-forecasting-profile-cleanup'
             ]
-            
+           
             lambda_status = {}
             for func_name in lambda_functions:
                 try:
@@ -502,55 +562,83 @@ class EnhancedMLOpsDeployer:
                         'exists': True,
                         'state': response['Configuration']['State']
                     }
+                except self.lambda_client.exceptions.ResourceNotFoundException:
+                    lambda_status[func_name] = {
+                        'exists': False,
+                        'error': 'Function not found'
+                    }
                 except Exception as e:
                     lambda_status[func_name] = {
                         'exists': False,
                         'error': str(e)
                     }
-            
+           
             validation_results['lambda_functions'] = lambda_status
-            
+           
             # Check Step Functions
+            state_machines = [
+                'energy-forecasting-enhanced-prediction-pipeline',
+                'energy-forecasting-training-pipeline'  # Added training pipeline validation
+            ]
+           
             stepfunctions_status = {}
-            state_machines = [self.config['enhanced_prediction_state_machine']]
-            
             for sm_name in state_machines:
                 try:
-                    sm_arn = f"arn:aws:states:{self.region}:{self.account_id}:stateMachine:{sm_name}"
-                    response = self.stepfunctions_client.describe_state_machine(stateMachineArn=sm_arn)
+                    response = self.stepfunctions_client.describe_state_machine(
+                        stateMachineArn=f"arn:aws:states:{self.region}:{self.account_id}:stateMachine:{sm_name}"
+                    )
                     stepfunctions_status[sm_name] = {
                         'exists': True,
                         'status': response['status']
+                    }
+                except self.stepfunctions_client.exceptions.StateMachineDoesNotExist:
+                    stepfunctions_status[sm_name] = {
+                        'exists': False,
+                        'error': 'State machine not found'
                     }
                 except Exception as e:
                     stepfunctions_status[sm_name] = {
                         'exists': False,
                         'error': str(e)
                     }
-            
+           
             validation_results['step_functions'] = stepfunctions_status
-            
-            # Check EventBridge rules
+           
+            # Check EventBridge rules (both prediction and training)
             try:
-                rules = self.events_client.list_rules(NamePrefix='energy-forecasting-enhanced')
+                rules = self.events_client.list_rules()
+                energy_rules = [rule for rule in rules['Rules'] if 'energy-forecasting' in rule['Name']]
+               
+                expected_rules = [
+                    'energy-forecasting-enhanced-daily-predictions',
+                    'energy-forecasting-monthly-training-pipeline'  # Added training schedule validation
+                ]
+               
+                found_rules = [rule['Name'] for rule in energy_rules]
+               
                 validation_results['eventbridge_rules'] = {
-                    'rules_count': len(rules['Rules']),
-                    'rules_found': [rule['Name'] for rule in rules['Rules']]
+                    'rules_count': len([rule for rule in found_rules if rule in expected_rules]),
+                    'rules_found': [rule for rule in found_rules if rule in expected_rules],
+                    'rules_missing': [rule for rule in expected_rules if rule not in found_rules],
+                    'all_expected_rules': expected_rules
                 }
+               
             except Exception as e:
                 validation_results['eventbridge_rules'] = {
                     'error': str(e)
                 }
-            
+           
             # Overall assessment
             lambda_success = sum(1 for status in lambda_status.values() if status.get('exists'))
             stepfunctions_success = sum(1 for status in stepfunctions_status.values() if status.get('exists'))
-            
+            eventbridge_success = validation_results.get('eventbridge_rules', {}).get('rules_count', 0)
+           
             overall_success = (
                 lambda_success == len(lambda_functions) and
-                stepfunctions_success == len(state_machines)
+                stepfunctions_success == len(state_machines) and
+                eventbridge_success >= 2  # Both prediction and training rules
             )
-            
+           
             return {
                 'status': 'success' if overall_success else 'partial',
                 'overall_success': overall_success,
@@ -558,10 +646,11 @@ class EnhancedMLOpsDeployer:
                 'summary': {
                     'lambda_functions_deployed': f"{lambda_success}/{len(lambda_functions)}",
                     'step_functions_deployed': f"{stepfunctions_success}/{len(state_machines)}",
+                    'eventbridge_rules_deployed': f"{eventbridge_success}/2",
                     'deployment_complete': overall_success
                 }
             }
-            
+           
         except Exception as e:
             return {
                 'status': 'failed',
@@ -723,26 +812,78 @@ class EnhancedMLOpsDeployer:
 
     def _generate_deployment_summary(self, deployment_results: Dict, deployment_time: float) -> Dict[str, Any]:
         """Generate comprehensive deployment summary"""
-        
+       
         try:
             # Calculate success metrics
             successful_components = 0
             total_components = len(deployment_results)
-            
+           
+            # Define success criteria for each component type
+            def is_component_successful(component_name: str, result: Any) -> bool:
+                """Determine if a component is successful based on its specific criteria"""
+               
+                if not isinstance(result, dict):
+                    # Handle non-dict results (like True/False for containers)
+                    return bool(result)
+               
+                # Component-specific success criteria
+                if component_name == 'environment_validation':
+                    return result.get('environment_ready', False) and result.get('overall_status') == 'GOOD'
+               
+                elif component_name == 'enhanced_lambdas':
+                    # Check if all lambda functions were deployed successfully
+                    # Assume success if we have function ARNs and no deployment errors
+                    if 'error' in result:
+                        return False
+                    # Check if we have function deployments
+                    function_count = len([k for k, v in result.items() if isinstance(v, dict) and 'function_arn' in v])
+                    return function_count > 0
+               
+                elif component_name == 'enhanced_containers':
+                    # Containers return True/False
+                    return bool(result)
+               
+                elif component_name == 'enhanced_eventbridge':
+                    # Check both prediction and training rules were created successfully
+                    if result.get('status') != 'success':
+                        return False
+                    rules_created = result.get('rules_created', {})
+                    # Both rules should be present and not failed
+                    prediction_rule_ok = 'enhanced_prediction_rule' in rules_created and not str(rules_created['enhanced_prediction_rule']).startswith('FAILED')
+                    training_rule_ok = 'monthly_training_rule' in rules_created and not str(rules_created['monthly_training_rule']).startswith('FAILED')
+                    return prediction_rule_ok and training_rule_ok
+               
+                elif component_name in ['enhanced_step_functions', 'deployment_validation', 'integration_tests']:
+                    # These components use 'status' field
+                    return result.get('status') == 'success'
+               
+                else:
+                    # Fallback: check for status field or assume success if no error
+                    if 'status' in result:
+                        return result.get('status') == 'success'
+                    elif 'error' in result:
+                        return False
+                    else:
+                        return True
+           
+            # Count successful components
             for component, result in deployment_results.items():
-                if isinstance(result, dict):
-                    logger.info(f"==={component}:{result.get('status')}===")
-                if isinstance(result, dict) and result.get('status') != 'failed':
+                is_successful = is_component_successful(component, result)
+                if is_successful:
                     successful_components += 1
-            
+               
+                # Log component status for debugging
+                status = 'success' if is_successful else 'failed'
+                logger.info(f"==={component}:{status}===")
+           
             overall_success = (
                 successful_components == total_components and
                 deployment_results.get('integration_tests', {}).get('status') == 'success'
             )
-            
+           
             # Generate recommendations
             recommendations = self._generate_deployment_recommendations(deployment_results)
-            
+           
             summary = {
                 'deployment_summary': {
                     'overall_success': overall_success,
@@ -756,16 +897,18 @@ class EnhancedMLOpsDeployer:
                 'recommendations': recommendations,
                 'next_steps': self._generate_next_steps(deployment_results, overall_success),
                 'deployment_artifacts': {
-                    'enhanced_lambda_functions': 4,
-                    'enhanced_step_functions': 1,
-                    'eventbridge_rules': 1,
+                    'enhanced_lambda_functions': len([k for k, v in deployment_results.get('enhanced_lambdas', {}).items()
+                                                    if isinstance(v, dict) and 'function_arn' in v]),
+                    'enhanced_step_functions': 1 if deployment_results.get('enhanced_step_functions', {}).get('status') == 'success' else 0,
+                    'eventbridge_rules': 1 if deployment_results.get('enhanced_eventbridge', {}).get('status') == 'success' else 0,
                     'integration_tests': deployment_results.get('integration_tests', {}).get('summary', {}).get('total_tests', 0)
                 }
             }
-            
+           
             return summary
-            
+           
         except Exception as e:
+            logger.error(f"Error in deployment summary generation: {str(e)}")
             return {
                 'summary_generation_error': str(e),
                 'partial_deployment_results': deployment_results

@@ -966,12 +966,13 @@ def get_enhanced_step_functions_with_integration(roles, account_id, region, data
 
 def create_enhanced_eventbridge_rules(account_id, region, state_machine_arns):
     """
-    Create EventBridge rules for the enhanced prediction pipeline
+    Create EventBridge rules for both enhanced prediction and training pipelines
     """
    
     events_client = boto3.client('events', region_name=region)
+    created_rules = {}
    
-    # Enhanced prediction rule (can be triggered with different profile combinations)
+    # Enhanced prediction rule (daily at 6 AM UTC)
     prediction_rule_name = 'energy-forecasting-enhanced-daily-predictions'
    
     try:
@@ -993,7 +994,7 @@ def create_enhanced_eventbridge_rules(account_id, region, state_machine_arns):
                         "profiles": ["RNN", "RN", "M", "S", "AGR", "L", "A6"],  # All profiles by default
                         "execution_type": "scheduled_daily",
                         "priority": "normal",
-						"PredictionJobName": f"energy-prediction-daily-${{aws.events.event.ingestion-time}}",
+                        "PredictionJobName": f"energy-prediction-daily-${{aws.events.event.ingestion-time}}",
                         "PredictionImageUri": f"{account_id}.dkr.ecr.{region}.amazonaws.com/energy-prediction:latest"
                     })
                 }
@@ -1001,13 +1002,54 @@ def create_enhanced_eventbridge_rules(account_id, region, state_machine_arns):
         )
        
         print(f"✓ Created daily prediction rule: {prediction_rule_name}")
+        created_rules['enhanced_prediction_rule'] = prediction_rule_name
        
     except Exception as e:
         print(f" Failed to create prediction rule: {str(e)}")
+        created_rules['enhanced_prediction_rule'] = f"FAILED: {str(e)}"
    
-    return {
-        'enhanced_prediction_rule': prediction_rule_name
-    }
+    # Monthly training rule (last day of month at 4 AM UTC)
+    training_rule_name = 'energy-forecasting-monthly-training-pipeline'
+   
+    try:
+        events_client.put_rule(
+            Name=training_rule_name,
+            # Cron expression for last day of month at 4 AM UTC
+            # We use L (last) which means the last day of the month
+            ScheduleExpression='cron(0 4 L * ? *)',  # Last day of month at 4 AM UTC
+            State='DISABLED',  # Start disabled, can be enabled after testing
+            Description='Monthly training pipeline for energy forecasting model retraining'
+        )
+       
+        events_client.put_targets(
+            Rule=training_rule_name,
+            Targets=[
+                {
+                    'Id': '1',
+                    'Arn': state_machine_arns['training_pipeline'],
+                    'RoleArn': f"arn:aws:iam::{account_id}:role/EnergyForecastingEventBridgeRole",
+                    'Input': json.dumps({
+                        "PreprocessingJobName": f"energy-preprocessing-monthly-${{aws.events.event.ingestion-time}}",
+                        "TrainingJobName": f"energy-training-monthly-${{aws.events.event.ingestion-time}}",
+                        "PreprocessingImageUri": f"{account_id}.dkr.ecr.{region}.amazonaws.com/energy-preprocessing:latest",
+                        "TrainingImageUri": f"{account_id}.dkr.ecr.{region}.amazonaws.com/energy-training:latest",
+                        "execution_type": "scheduled_monthly",
+                        "priority": "high",
+                        "retrain_all_profiles": True,
+                        "model_validation_required": True
+                    })
+                }
+            ]
+        )
+       
+        print(f"✓ Created monthly training rule: {training_rule_name}")
+        created_rules['monthly_training_rule'] = training_rule_name
+       
+    except Exception as e:
+        print(f" Failed to create training rule: {str(e)}")
+        created_rules['monthly_training_rule'] = f"FAILED: {str(e)}"
+   
+    return created_rules
 
 if __name__ == "__main__":
     """
@@ -1055,6 +1097,37 @@ if __name__ == "__main__":
     print("✓ Automatic cost optimization with cleanup")
     print("✓ Profile-specific data processing")
     print("✓ Real-time execution monitoring")
+    print()
+    # Check status of all rules
+    print("=== EventBridge Schedule Status ===")
+    status = manage_eventbridge_schedules('us-west-2', 'status')
+    for rule, info in status.items():
+        if isinstance(info, dict):
+            print(f"{rule}:")
+            print(f"  State: {info['current_state']}")
+            print(f"  Schedule: {info['schedule']}")
+            print(f"  Description: {info['description']}")
+        else:
+            print(f"{rule}: {info}")
+   
+    print("\n=== Schedule Details ===")
+    print("Daily Predictions:")
+    print("  - Schedule: cron(0 6 * * ? *)  # Daily at 6 AM UTC")
+    print("  - Profiles: All 7 profiles (RNN, RN, M, S, AGR, L, A6)")
+    print("  - State: DISABLED by default")
+   
+    print("\nMonthly Training:")
+    print("  - Schedule: cron(0 4 L * ? *)  # Last day of month at 4 AM UTC")
+    print("  - Purpose: Complete model retraining for all profiles")
+    print("  - State: DISABLED by default")
+   
+    print("\n=== Management Commands ===")
+    print("Enable schedules:")
+    print("  python -c \"from infrastructure.step_functions_definitions import manage_eventbridge_schedules; print(manage_eventbridge_schedules('us-west-2', 'enable'))\"")
+   
+    print("\nDisable schedules:")
+    print("  python -c \"from infrastructure.step_functions_definitions import manage_eventbridge_schedules; print(manage_eventbridge_schedules('us-west-2', 'disable'))\"")
+
     print()
     print("Usage Examples:")
     print("1. Single profile test:")

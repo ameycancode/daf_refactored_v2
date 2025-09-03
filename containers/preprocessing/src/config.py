@@ -1,19 +1,21 @@
 """
 Simplified Configuration Management for Energy Forecasting System
-Container-ready version that doesn't require external config files
+Container-ready version with Redshift integration
 """
 
 import os
 import json
 import boto3
-from datetime import datetime
+import time
+import traceback
+from datetime import datetime, timedelta
 import pytz
 import logging
 
 logger = logging.getLogger(__name__)
 
 class EnergyForecastingConfig:
-    """Simplified configuration management for containers"""
+    """Simplified configuration management for containers with Redshift support"""
    
     def __init__(self, config_file=None):
         self.pacific_tz = pytz.timezone("America/Los_Angeles")
@@ -22,12 +24,14 @@ class EnergyForecastingConfig:
         # Initialize boto3 clients
         try:
             self.s3_client = boto3.client('s3')
+            self.redshift_data_client = boto3.client('redshift-data', region_name='us-west-2')
             self.region = boto3.Session().region_name
             self.account_id = boto3.client('sts').get_caller_identity()['Account']
             logger.info(f"AWS connection successful. Region: {self.region}, Account: {self.account_id}")
         except Exception as e:
             logger.warning(f"AWS connection failed: {str(e)}")
             self.s3_client = None
+            self.redshift_data_client = None
             self.region = "us-west-2"
             self.account_id = "123456789012"
        
@@ -64,7 +68,7 @@ class EnergyForecastingConfig:
                 base_dict[key] = value
    
     def _get_default_config(self):
-        """Get default configuration matching original implementation"""
+        """Get default configuration matching original implementation with Redshift support"""
         return {
             # S3 Configuration (matches your original structure)
             "s3": {
@@ -76,6 +80,19 @@ class EnergyForecastingConfig:
                 "output_data_prefix": "archived_folders/forecasting/data/xgboost/output/",
                 "model_prefix": "xgboost/",
                 "train_results_prefix": "archived_folders/forecasting/data/xgboost/train_results/"
+            },
+            
+            # Redshift Configuration
+            "redshift": {
+                "database": "sdcp",
+                "cluster_identifier": "sdcp-edp-backend-dev",
+                "db_user": "ds_service_user",
+                "region": "us-west-2",
+                "schema": "edp_cust_dev",
+                "table": "caiso_sqmd",
+                "query_timeout_seconds": 1800,
+                "use_redshift": True,  # Toggle between Redshift and CSV
+                "data_reading_period_days": None # All data; 0.3 * 365  # ~109 days, configurable
             },
            
             # Data Processing Configuration (from your original code)
@@ -183,7 +200,20 @@ class EnergyForecastingConfig:
             }
         }
    
-    # S3 Path Generators
+    # Redshift Configuration getters
+    def get_redshift_config(self):
+        """Get Redshift configuration"""
+        return self.config["redshift"]
+    
+    def is_redshift_enabled(self):
+        """Check if Redshift is enabled"""
+        return self.config["redshift"].get("use_redshift", True)
+    
+    def get_data_reading_period_days(self):
+        """Get data reading period in days"""
+        return self.config["redshift"].get("data_reading_period_days", None)
+   
+    # S3 Path Generators (unchanged from original)
     def get_s3_path(self, path_type, **kwargs):
         """Generate S3 paths based on configuration"""
         bucket = self.config["s3"]["data_bucket"]
@@ -243,7 +273,7 @@ class EnergyForecastingConfig:
         s3_key = s3_path.split('/', 3)[-1] + filename
         return s3_key
    
-    # Configuration getters
+    # Configuration getters (unchanged from original)
     def get_profiles(self):
         """Get all profile codes"""
         return list(self.config["data_processing"]["profile_mappings"].values())
@@ -268,7 +298,7 @@ class EnergyForecastingConfig:
         """Get data processing configuration"""
         return self.config["data_processing"]
    
-    # S3 bucket getters
+    # S3 bucket getters (unchanged from original)
     @property
     def data_bucket(self):
         return self.config["s3"]["data_bucket"]
@@ -293,8 +323,238 @@ class EnergyForecastingConfig:
             logger.error(f"Failed to save config to {filepath}: {str(e)}")
             return False
 
+
+class RedshiftDataManager:
+    """Redshift data operations using Data API"""
+    
+    def __init__(self, config: EnergyForecastingConfig):
+        self.config = config
+        self.redshift_config = config.get_redshift_config()
+        self.redshift_client = config.redshift_data_client
+        
+    def execute_query(self, query, query_limit=None):
+        """Execute Redshift query using Data API with pagination support"""
+        try:
+            if not self.redshift_client:
+                raise Exception("Redshift client not available")
+                
+            if query_limit and query_limit > 0:
+                query += f" LIMIT {query_limit}"
+                
+            logger.info(f"Executing query via Data API on cluster: {self.redshift_config['cluster_identifier']}")
+            logger.info(f"Database: {self.redshift_config['database']}, User: {self.redshift_config['db_user']}")
+            logger.info(f"Query: {query}")
+            
+            # Execute the query
+            response = self.redshift_client.execute_statement(
+                ClusterIdentifier=self.redshift_config['cluster_identifier'],
+                Database=self.redshift_config['database'],
+                DbUser=self.redshift_config['db_user'],
+                Sql=query
+            )
+            
+            query_id = response['Id']
+            logger.info(f"Query submitted with ID: {query_id}")
+            
+            # Wait for completion
+            self._wait_for_completion(query_id)
+            
+            # Get all results with pagination
+            df = self._get_paginated_results(query_id)
+            
+            logger.info(f"Query completed successfully. Retrieved {len(df)} rows")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error executing query via Data API: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def _wait_for_completion(self, query_id):
+        """Wait for query completion"""
+        max_wait = self.redshift_config.get('query_timeout_seconds', 1800)
+        waited = 0
+        
+        logger.info(f"Waiting for query {query_id} to complete...")
+        
+        while waited < max_wait:
+            try:
+                status_response = self.redshift_client.describe_statement(Id=query_id)
+                status = status_response['Status']
+                
+                if status == 'FINISHED':
+                    logger.info(f"Query {query_id} completed successfully")
+                    return
+                elif status == 'FAILED':
+                    error_msg = status_response.get('Error', 'Unknown error')
+                    logger.error(f"Query {query_id} failed: {error_msg}")
+                    raise Exception(f'Query failed: {error_msg}')
+                elif status == 'ABORTED':
+                    logger.error(f"Query {query_id} was aborted")
+                    raise Exception(f'Query was aborted')
+                
+                # Still running
+                if waited % 60 == 0 and waited > 0:  # Log every minute
+                    logger.info(f"Query still running... waited {waited}s (status: {status})")
+                
+                time.sleep(10)
+                waited += 10
+                
+            except Exception as e:
+                if 'failed:' in str(e) or 'aborted' in str(e):
+                    raise
+                else:
+                    logger.warning(f"Error checking query status: {str(e)}")
+                    time.sleep(10)
+                    waited += 10
+                    continue
+        
+        raise Exception(f'Query timed out after {max_wait} seconds')
+    
+    def _get_paginated_results(self, query_id):
+        """Get all results with proper pagination"""
+        import pandas as pd
+        
+        all_records = []
+        column_metadata = None
+        next_token = None
+        page_count = 0
+        
+        try:
+            while True:
+                page_count += 1
+                logger.info(f"Fetching results page {page_count}...")
+                
+                # Prepare request parameters
+                request_params = {'Id': query_id}
+                if next_token:
+                    request_params['NextToken'] = next_token
+                
+                # Get results page
+                result_response = self.redshift_client.get_statement_result(**request_params)
+                
+                # Get column metadata from first page only
+                if column_metadata is None:
+                    column_metadata = result_response.get('ColumnMetadata', [])
+                    logger.info(f"Query has {len(column_metadata)} columns")
+                
+                # Get records from this page
+                page_records = result_response.get('Records', [])
+                all_records.extend(page_records)
+                
+                logger.info(f"Page {page_count}: Retrieved {len(page_records)} records (Total: {len(all_records)})")
+                
+                # Check if there are more pages
+                next_token = result_response.get('NextToken')
+                if not next_token:
+                    logger.info(f"Pagination complete. Total pages: {page_count}, Total records: {len(all_records)}")
+                    break
+            
+            # Convert to DataFrame
+            df = self._convert_to_dataframe(column_metadata, all_records)
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error in paginated result retrieval: {str(e)}")
+            raise
+    
+    def _convert_to_dataframe(self, column_metadata, all_records):
+        """Convert Redshift Data API results to DataFrame"""
+        import pandas as pd
+        
+        try:
+            # Get column names
+            column_names = [col['name'] for col in column_metadata]
+            
+            logger.info(f"Converting {len(all_records)} records with {len(column_names)} columns")
+            
+            if not all_records:
+                return pd.DataFrame(columns=column_names)
+            
+            # Convert records to list of lists
+            data_rows = []
+            for record in all_records:
+                row = []
+                for field in record:
+                    # Extract value based on type
+                    if 'stringValue' in field:
+                        row.append(field['stringValue'])
+                    elif 'longValue' in field:
+                        row.append(field['longValue'])
+                    elif 'doubleValue' in field:
+                        row.append(field['doubleValue'])
+                    elif 'booleanValue' in field:
+                        row.append(field['booleanValue'])
+                    elif 'isNull' in field and field['isNull']:
+                        row.append(None)
+                    else:
+                        row.append(str(field))  # Fallback
+                data_rows.append(row)
+            
+            # Create DataFrame
+            df = pd.DataFrame(data_rows, columns=column_names)
+            
+            logger.info(f"DataFrame created: {len(df)} rows, {len(column_names)} columns")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error converting results to DataFrame: {str(e)}")
+            raise
+    
+    def query_sqmd_data(self, current_date=None, query_limit=None):
+        """Query SQMD data from Redshift with time filtering"""
+        try:
+            if current_date is None:
+                current_date = datetime.now()
+            
+            schema_name = self.redshift_config['schema']
+            table_name = self.redshift_config['table']
+            
+            # Calculate time range based on data reading period
+            data_period_days = self.config.get_data_reading_period_days()
+            
+            if data_period_days:
+                start_date = current_date - timedelta(days=data_period_days)
+                logger.info(f"Filtering data from {start_date.strftime('%Y-%m-%d')} to {current_date.strftime('%Y-%m-%d')}")
+                
+                query = f"""
+                SELECT
+                    tradedatelocal as tradedate,
+                    tradehourstartlocal as tradetime,
+                    loadprofile, rategroup, baseload, lossadjustedload, metercount,
+                    loadbl, loadlal, loadmetercount, genbl, genlal, genmetercount,
+                    submission, createddate as created
+                FROM {schema_name}.{table_name}
+                WHERE tradedatelocal >= '{start_date.strftime('%Y-%m-%d')}'
+                ORDER BY tradedatelocal, tradehourstartlocal
+                """
+            else:
+                logger.info("No time limit set - fetching all available data")
+                query = f"""
+                SELECT
+                    tradedatelocal as tradedate,
+                    tradehourstartlocal as tradetime,
+                    loadprofile, rategroup, baseload, lossadjustedload, metercount,
+                    loadbl, loadlal, loadmetercount, genbl, genlal, genmetercount,
+                    submission, createddate as created
+                FROM {schema_name}.{table_name}
+                ORDER BY tradedatelocal, tradehourstartlocal
+                """
+            
+            logger.info(f"Executing SQMD data query")
+            df = self.execute_query(query, query_limit)
+            
+            logger.info(f"Retrieved {len(df)} rows of SQMD data from Redshift")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error querying SQMD data: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+
 class S3FileManager:
-    """S3 file manager using configuration"""
+    """S3 file manager using configuration (unchanged from original)"""
    
     def __init__(self, config: EnergyForecastingConfig):
         self.config = config

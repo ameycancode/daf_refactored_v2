@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Refactored Preprocessing Container for SageMaker
-Matches original main_preprocess.py exactly with proper S3 operations
+Enhanced with Redshift integration and improved data processing
 """
 
 import os
@@ -11,6 +11,7 @@ import numpy as np
 from datetime import datetime
 import pytz
 import logging
+import time
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,13 +20,14 @@ logger = logging.getLogger(__name__)
 # Add src directory to path
 sys.path.append('/opt/ml/processing/code/src')
 
-from config import EnergyForecastingConfig, S3FileManager
+from config import EnergyForecastingConfig, S3FileManager, RedshiftDataManager
 
 class EnergyPreprocessingPipeline:
     def __init__(self):
         # Initialize configuration
         self.config = EnergyForecastingConfig()
         self.s3_manager = S3FileManager(self.config)
+        self.redshift_manager = RedshiftDataManager(self.config)
         self.paths = self.config.get_container_paths()
        
         # Pacific timezone
@@ -33,42 +35,43 @@ class EnergyPreprocessingPipeline:
         self.current_date = self.config.current_date_str
        
         logger.info(f"Preprocessing pipeline initialized for date: {self.current_date}")
+        logger.info(f"Redshift enabled: {self.config.is_redshift_enabled()}")
    
     def run_preprocessing(self):
-        """Main preprocessing pipeline matching original implementation"""
+        """Main preprocessing pipeline with Redshift integration"""
         try:
             logger.info("Starting preprocessing pipeline...")
             start_time = datetime.now()
            
-            # Step 1: Process Load Data (equivalent to process_load_data)
+            # Step 1: Process Load Data (enhanced with Redshift support)
             logger.info("Step 1: Processing Load Data...")
             df_load = self._process_load_data()
            
-            # Step 2: Process Temperature Data (equivalent to process_temperature_data)
+            # Step 2: Process Temperature Data (unchanged)
             logger.info("Step 2: Processing Temperature Data...")
             df_temperature = self._process_temperature_data()
            
-            # Step 3: Merge Load and Temperature (equivalent to merge_load_temperature)
+            # Step 3: Merge Load and Temperature (unchanged)
             logger.info("Step 3: Merging Load and Temperature Data...")
             df_merged = self._merge_load_temperature(df_load, df_temperature)
            
-            # Step 4: Generate Data Profiles (equivalent to generate_data_profile)
+            # Step 4: Generate Data Profiles (unchanged)
             logger.info("Step 4: Generating Data by Profile...")
             profile_dfs = self._generate_data_profile(df_merged)
            
-            # Step 5: Create Lag Features (equivalent to save_lagged_profiles)
+            # Step 5: Create Lag Features (unchanged)
             logger.info("Step 5: Creating Lag Features...")
             lagged_dfs = self._save_lagged_profiles(profile_dfs)
            
-            # Step 6: Replace Count Data (equivalent to replace_count_i)
+            # Step 6: Replace Count Data (unchanged)
             logger.info("Step 6: Replacing Count Data...")
             replaced_dfs = self._replace_count_i(lagged_dfs)
            
-            # Step 7: Add Radiation for RN (equivalent to add_radiation_to_df_RN)
+            # Step 7: Add Radiation for RN (unchanged)
             logger.info("Step 7: Adding Radiation Data for RN...")
             final_dfs = self._add_radiation_to_df_RN(replaced_dfs)
            
-            # Step 8: Train-Test Split (equivalent to train_test_split)
+            # Step 8: Train-Test Split (unchanged)
             logger.info("Step 8: Performing Train-Test Split...")
             self._train_test_split(final_dfs)
            
@@ -83,7 +86,96 @@ class EnergyPreprocessingPipeline:
             raise
    
     def _process_load_data(self):
-        """Process load data - matches original process_load_data function"""
+        """Enhanced load data processing with Redshift integration and CSV fallback"""
+        start_time = time.time()
+        
+        try:
+            if self.config.is_redshift_enabled():
+                logger.info("Using Redshift data source...")
+                df = self._process_load_data_from_redshift()
+            else:
+                logger.info("Using CSV data source...")
+                df = self._process_load_data_from_csv()
+                
+            # Save processed data to S3
+            s3_key = f"{self.config.config['s3']['processed_data_prefix']}hourly_data/Hourly_Load_Data_{self.current_date}.csv"
+            self.s3_manager.upload_dataframe(df, s3_key)
+            
+            end_time = time.time()
+            logger.info(f"Load data processing completed in {(end_time - start_time)/60:.2f} minutes")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Load data processing failed: {str(e)}")
+            # Try fallback if Redshift was enabled
+            if self.config.is_redshift_enabled():
+                logger.warning("Redshift failed, attempting CSV fallback...")
+                try:
+                    df = self._process_load_data_from_csv()
+                    logger.info("Successfully processed data using CSV fallback")
+                    return df
+                except Exception as csv_error:
+                    logger.error(f"CSV fallback also failed: {str(csv_error)}")
+            raise
+    
+    def _process_load_data_from_redshift(self):
+        """Process load data from Redshift with enhanced data handling"""
+        logger.info("Reading SQMD data from Redshift...")
+        
+        # Query data from Redshift
+        df = self.redshift_manager.query_sqmd_data()
+        
+        if df.empty:
+            raise ValueError("No SQMD data retrieved from Redshift")
+        
+        logger.info(f"Successfully read {len(df)} rows of SQMD data from Redshift")
+        
+        # Process datetime columns with robust handling
+        df = self._process_datetime_columns(df)
+        
+        # Create profile and NEM classifications
+        df['RateGroup'] = df['rategroup'].astype(str)
+        df['NEM'] = df['RateGroup'].apply(lambda x: 'NEM' if x.startswith(('NEM', 'SBP')) else 'Non_NEM')
+        df['Profile'] = df.apply(lambda row: row['loadprofile'] + '_' + row['NEM'] if row['loadprofile'] == 'RES' else row['loadprofile'], axis=1)
+        
+        # Select and rename columns
+        df = df[['TradeDateTime', 'tradedate', 'tradetime', 'Profile', 'lossadjustedload', 'metercount', 'submission']].copy()
+        df.columns = ['TradeDateTime', 'TradeDate', 'TradeTime', 'Profile', 'LossAdjustedLoad', 'MeterCount', 'Submission']
+        
+        # Enhanced numeric data cleaning
+        df = self._clean_numeric_data(df)
+        
+        # Process Final and Initial submissions
+        df_final, df_initial = self._separate_submissions(df)
+        
+        # Aggregate hourly data
+        df_hour_final = self._aggregate_hourly_data(df_final, 'final')
+        df_hour_initial = self._aggregate_hourly_data(df_initial, 'initial')
+        
+        # Calculate load per meter
+        df_hour_final['Load_Per_Meter'] = self._safe_division(df_hour_final['LoadHour'], df_hour_final['Count'])
+        df_hour_initial['Load_Per_Meter'] = self._safe_division(df_hour_initial['LoadHour'], df_hour_initial['Count'])
+        
+        # Rename initial columns
+        df_hour_initial = df_hour_initial.rename(columns={
+            'LoadHour': 'LoadHour_I',
+            'Count': 'Count_I',
+            'Load_Per_Meter': 'Load_Per_Meter_I'
+        })
+        
+        # Merge final and initial data
+        df_merged = pd.merge(df_hour_final, df_hour_initial, on=['TradeDateTime', 'Profile'], how='right')
+        df_processed = df_merged[['TradeDateTime', 'Profile', 'Count', 'Load_Per_Meter', 'Count_I', 'Load_Per_Meter_I']].copy()
+        
+        # Extend dataset and add features
+        df_extended = self._extend_dataset(df_processed)
+        df_final = self._add_date_features(df_extended)
+        
+        logger.info(f"Processed Redshift data: {len(df_final)} records")
+        return df_final
+    
+    def _process_load_data_from_csv(self):
+        """Process load data from CSV file (original implementation)"""
         input_file = os.path.join(self.paths['input_path'], self.config.get_file_path('load_data'))
        
         if not os.path.exists(input_file):
@@ -130,35 +222,153 @@ class EnergyPreprocessingPipeline:
         df_merged = pd.merge(df_hour_final, df_hour_initial, on=['TradeDateTime', 'Profile'], how='right')
         df = df_merged[['TradeDateTime', 'Profile', 'Count', 'Load_Per_Meter', 'Count_I', 'Load_Per_Meter_I']].copy()
        
-        # Extend dataset (40 days into future)
+        # Extend dataset and add features
+        df_extended = self._extend_dataset(df)
+        df_final = self._add_date_features(df_extended)
+       
+        logger.info(f"Processed CSV data: {len(df_final)} records")
+        return df_final
+    
+    def _process_datetime_columns(self, df):
+        """Robust datetime processing for Redshift data"""
+        try:
+            # Try the expected format first
+            df['TradeDateTime'] = pd.to_datetime(df['tradedate'] + ' ' + df['tradetime'], format='%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            logger.info("Standard time format failed, trying to handle Redshift time format...")
+            logger.info(f"Sample tradedate: {df['tradedate'].iloc[0] if not df.empty else 'N/A'}")
+            logger.info(f"Sample tradetime: {df['tradetime'].iloc[0] if not df.empty else 'N/A'}")
+           
+            # Handle case where tradetime might be just hours
+            def create_datetime(row):
+                date_str = str(row['tradedate'])
+                time_str = str(row['tradetime'])
+               
+                # If time is just hours, add minutes and seconds
+                if len(time_str) <= 2:
+                    time_str = f"{time_str.zfill(2)}:00:00"
+                elif ':' not in time_str:
+                    time_str = f"{time_str.zfill(2)}:00:00"
+               
+                datetime_str = f"{date_str} {time_str}"
+                return pd.to_datetime(datetime_str, errors='coerce')
+           
+            df['TradeDateTime'] = df.apply(create_datetime, axis=1)
+           
+            # Check for any NaT values
+            nat_count = df['TradeDateTime'].isna().sum()
+            if nat_count > 0:
+                logger.warning(f"Warning: {nat_count} rows have invalid datetime values")
+                df = df.dropna(subset=['TradeDateTime'])
+                logger.info(f"Removed {nat_count} rows with invalid datetime, remaining: {len(df)} rows")
+        
+        return df
+    
+    def _clean_numeric_data(self, df):
+        """Enhanced numeric data cleaning"""
+        logger.info("Converting numeric columns to proper types...")
+        logger.info(f"LossAdjustedLoad dtype before: {df['LossAdjustedLoad'].dtype}")
+        logger.info(f"MeterCount dtype before: {df['MeterCount'].dtype}")
+       
+        # Convert to numeric, handling any non-numeric values
+        df['LossAdjustedLoad'] = pd.to_numeric(df['LossAdjustedLoad'], errors='coerce')
+        df['MeterCount'] = pd.to_numeric(df['MeterCount'], errors='coerce')
+       
+        # Remove rows with invalid numeric values
+        invalid_load = df['LossAdjustedLoad'].isna().sum()
+        invalid_meter = df['MeterCount'].isna().sum()
+       
+        if invalid_load > 0 or invalid_meter > 0:
+            logger.warning(f"Found {invalid_load} invalid LossAdjustedLoad values and {invalid_meter} invalid MeterCount values")
+            df = df.dropna(subset=['LossAdjustedLoad', 'MeterCount'])
+            logger.info(f"Removed invalid rows, remaining: {len(df)} rows")
+       
+        logger.info(f"LossAdjustedLoad dtype after: {df['LossAdjustedLoad'].dtype}")
+        logger.info(f"MeterCount dtype after: {df['MeterCount'].dtype}")
+        
+        return df
+    
+    def _separate_submissions(self, df):
+        """Separate Final and Initial submissions"""
+        df_final = df[df['Submission'] == 'Final']
+        df_initial = df[df['Submission'] == 'Initial']
+        
+        logger.info(f"Final submissions: {len(df_final)} rows")
+        logger.info(f"Initial submissions: {len(df_initial)} rows")
+        
+        return df_final, df_initial
+    
+    def _aggregate_hourly_data(self, df, submission_type):
+        """Aggregate data by hour with enhanced error handling"""
+        if df.empty:
+            logger.warning(f"No data to aggregate for {submission_type} submissions")
+            return pd.DataFrame(columns=['TradeDateTime', 'Profile', 'LoadHour', 'Count'])
+        
+        # Ensure numeric columns are properly typed before aggregation
+        df['LossAdjustedLoad'] = pd.to_numeric(df['LossAdjustedLoad'], errors='coerce')
+        df['MeterCount'] = pd.to_numeric(df['MeterCount'], errors='coerce')
+        
+        # Group by hourly
+        df_hour = df.groupby(['TradeDateTime', 'Profile']).agg(
+            LoadHour=('LossAdjustedLoad', 'sum'),
+            Count=('MeterCount', 'sum')
+        ).reset_index()
+        
+        # Ensure aggregated columns are numeric
+        df_hour['LoadHour'] = pd.to_numeric(df_hour['LoadHour'], errors='coerce')
+        df_hour['Count'] = pd.to_numeric(df_hour['Count'], errors='coerce')
+        
+        logger.info(f"Aggregated {submission_type} data: {len(df_hour)} hourly records")
+        return df_hour
+    
+    def _safe_division(self, numerator, denominator):
+        """Safe division with error handling"""
+        try:
+            result = numerator.astype(float) / denominator.astype(float)
+            # Handle division by zero or infinity
+            result = result.replace([np.inf, -np.inf], np.nan)
+            return result
+        except Exception as e:
+            logger.error(f"Error during division operations: {e}")
+            # Force conversion and try again
+            result = pd.to_numeric(numerator, errors='coerce') / pd.to_numeric(denominator, errors='coerce')
+            result = result.replace([np.inf, -np.inf], np.nan)
+            return result
+    
+    def _extend_dataset(self, df):
+        """Extend dataset with future dates (40 days)"""
         max_date = df['TradeDateTime'].max()
         extended_dates = pd.date_range(start=max_date + pd.Timedelta(hours=1), periods=40 * 24, freq='h')
         profiles = df['Profile'].unique()
         extended_df = pd.DataFrame({'TradeDateTime': extended_dates}).merge(
             pd.DataFrame(profiles, columns=['Profile']), how='cross'
         )
-       
-        df = pd.concat([df, extended_df], ignore_index=True)
-       
-        # Add date features
+        
+        df_extended = pd.concat([df, extended_df], ignore_index=True)
+        logger.info(f"Extended dataset: {len(df_extended)} records (added {len(extended_df)} future records)")
+        
+        return df_extended
+    
+    def _add_date_features(self, df):
+        """Add date-related features"""
         df['Year'] = df['TradeDateTime'].dt.year
         df['Month'] = df['TradeDateTime'].dt.month
         df['Day'] = df['TradeDateTime'].dt.day
         df['Hour'] = df['TradeDateTime'].dt.hour
         df['Weekday'] = df['TradeDateTime'].dt.day_name()
         df['Season'] = df['Month'].apply(lambda x: 'Winter' if x in [1, 2, 3, 4, 5, 11, 12] else 'Summer')
-       
+        
         # Add holidays
         holidays = self.config.get_data_processing_config()['holidays']
         df['TradeDate'] = df['TradeDateTime'].dt.date.astype(str)
         df['Holiday'] = df['TradeDate'].isin(holidays).astype(int)
         df['Workday'] = df.apply(lambda x: 0 if (x['Holiday'] == 1 or x['Weekday'] in ['Saturday', 'Sunday']) else 1, axis=1)
-       
-        logger.info(f"Processed load data: {len(df)} records")
+        
+        logger.info("Added date features and holiday information")
         return df
    
     def _process_temperature_data(self):
-        """Process temperature data - matches original process_temperature_data function"""
+        """Process temperature data (unchanged from original)"""
         input_file = os.path.join(self.paths['input_path'], self.config.get_file_path('temperature_data'))
        
         if not os.path.exists(input_file):
@@ -192,7 +402,7 @@ class EnergyPreprocessingPipeline:
         return df_t
    
     def _merge_load_temperature(self, df_load, df_temperature):
-        """Merge load and temperature data - matches original merge_load_temperature function"""
+        """Merge load and temperature data (unchanged from original)"""
         # Merge data
         df = pd.merge(df_load, df_temperature, on=['TradeDate', 'Hour'], how='left')
        
@@ -215,7 +425,7 @@ class EnergyPreprocessingPipeline:
         return df
    
     def _generate_data_profile(self, df):
-        """Generate data profiles - matches original generate_data_profile function"""
+        """Generate data profiles (unchanged from original)"""
         # Replace null values
         df['Count'] = df['Count'].fillna(df['Count_I'])
         df['Load'] = df['Load'].fillna(df['Load_I'])
@@ -231,7 +441,7 @@ class EnergyPreprocessingPipeline:
         return profile_dfs
    
     def _save_lagged_profiles(self, profile_dfs):
-        """Create lag features - matches original save_lagged_profiles function"""
+        """Create lag features (unchanged from original)"""
         profile_start_dates = self.config.get_data_processing_config()['profile_start_dates']
         lag_config = self.config.get_data_processing_config()['lag_features']
        
@@ -265,7 +475,7 @@ class EnergyPreprocessingPipeline:
         return lagged_dfs
    
     def _replace_count_i(self, lagged_dfs):
-        """Replace Count_I - matches original replace_count_i function"""
+        """Replace Count_I (unchanged from original)"""
         updated_dfs = {}
        
         for profile, df in lagged_dfs.items():
@@ -294,7 +504,7 @@ class EnergyPreprocessingPipeline:
         return updated_dfs
    
     def _add_radiation_to_df_RN(self, updated_dfs):
-        """Add radiation data to RN profile - matches original add_radiation_to_df_RN function"""
+        """Add radiation data to RN profile (unchanged from original)"""
         radiation_file = os.path.join(self.paths['input_path'], self.config.get_file_path('radiation_data'))
        
         if not os.path.exists(radiation_file):
@@ -333,7 +543,7 @@ class EnergyPreprocessingPipeline:
         return updated_dfs
    
     def _train_test_split(self, final_dfs):
-        """Perform train-test split - matches original train_test_split function"""
+        """Perform train-test split (unchanged from original)"""
         split_date = pd.to_datetime(self.config.get_data_processing_config()['split_date'])
        
         for profile, df in final_dfs.items():
@@ -373,7 +583,7 @@ class EnergyPreprocessingPipeline:
             logger.info(f"Split {profile}: {len(train_set)} train, {len(test_set)} test records")
    
     def _save_processing_summary(self, start_time):
-        """Save processing summary"""
+        """Save processing summary with enhanced information"""
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
        
@@ -384,11 +594,15 @@ class EnergyPreprocessingPipeline:
             "split_date": self.config.get_data_processing_config()['split_date'],
             "current_date": self.current_date,
             "profiles_processed": self.config.get_profiles(),
+            "data_source": "redshift" if self.config.is_redshift_enabled() else "csv",
+            "redshift_enabled": self.config.is_redshift_enabled(),
+            "data_reading_period_days": self.config.get_data_reading_period_days(),
             "status": "completed",
             "configuration_used": {
                 "data_bucket": self.config.data_bucket,
                 "model_bucket": self.config.model_bucket,
-                "lag_features": self.config.get_data_processing_config()['lag_features']
+                "lag_features": self.config.get_data_processing_config()['lag_features'],
+                "redshift_config": self.config.get_redshift_config() if self.config.is_redshift_enabled() else None
             }
         }
        
@@ -401,11 +615,13 @@ class EnergyPreprocessingPipeline:
         logger.info(f"Processing completed in {processing_time/60:.2f} minutes")
    
     def _save_error_log(self, error_message):
-        """Save error log"""
+        """Save error log with enhanced information"""
         error_log = {
             "timestamp": datetime.now().isoformat(),
             "current_date": self.current_date,
             "error": error_message,
+            "data_source": "redshift" if self.config.is_redshift_enabled() else "csv",
+            "redshift_enabled": self.config.is_redshift_enabled(),
             "status": "failed"
         }
        
@@ -414,6 +630,7 @@ class EnergyPreprocessingPipeline:
         s3_key = f"{self.config.config['s3']['processed_data_prefix']}error_log_{self.current_date}.json"
        
         self.s3_manager.save_and_upload_file(error_log, local_file, s3_key)
+
 
 def main():
     """Main entry point for preprocessing container"""
@@ -425,6 +642,7 @@ def main():
     except Exception as e:
         logger.error(f"Preprocessing pipeline failed: {str(e)}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
