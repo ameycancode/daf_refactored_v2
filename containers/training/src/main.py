@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Refactored Training Container for SageMaker
-Matches original train_workflow.py exactly with proper S3 operations
 """
 
 import os
@@ -40,10 +39,11 @@ class EnergyTrainingPipeline:
         self.pacific_tz = pytz.timezone("America/Los_Angeles")
         self.current_date = self.config.current_date_str
         
-        # Training configuration
+        # Training configuration from JSON
         self.training_config = self.config.get_training_config()
         
         logger.info(f"Training pipeline initialized for date: {self.current_date}")
+        logger.info(f"Training config: {self.training_config}")
     
     def run_training(self):
         """Main training pipeline matching original train_workflow.py"""
@@ -289,7 +289,7 @@ class EnergyTrainingPipeline:
         logger.info(f"Training data validation passed: {len(X_train)} samples, {len(X_train.columns)} features")
         logger.info(f"Target range: {y_train.min():.4f} to {y_train.max():.4f}")
         
-        # XGBoost parameters exactly as in original
+        # XGBoost parameters from JSON configuration
         param_grid = self.training_config['xgboost_params']
         
         # Create XGBoost regressor with additional stability parameters
@@ -324,10 +324,17 @@ class EnergyTrainingPipeline:
             # Try with simpler parameters if grid search fails
             logger.info("Attempting training with simpler parameters...")
             
+            # Get simplified parameters from JSON config or use defaults
+            simple_params = TRAINING_CONFIG.get("xgboost", {
+                "n_estimators": 100,
+                "learning_rate": 0.1,
+                "max_depth": 6
+            })
+            
             simple_xgb = xgb.XGBRegressor(
-                n_estimators=100,
-                learning_rate=0.1,
-                max_depth=6,
+                n_estimators=simple_params.get("n_estimators", 100),
+                learning_rate=simple_params.get("learning_rate", 0.1),
+                max_depth=simple_params.get("max_depth", 6),
                 random_state=self.training_config.get('random_state', 42),
                 tree_method='hist',
                 objective='reg:squarederror',
@@ -340,11 +347,7 @@ class EnergyTrainingPipeline:
             class MockGridSearch:
                 def __init__(self, estimator):
                     self.best_estimator_ = estimator
-                    self.best_params_ = {
-                        'n_estimators': 100,
-                        'learning_rate': 0.1,
-                        'max_depth': 6
-                    }
+                    self.best_params_ = simple_params
             
             grid_search = MockGridSearch(simple_xgb)
         
@@ -597,7 +600,15 @@ class EnergyTrainingPipeline:
             'successful_profiles': len([r for r in results.values() if 'error' not in r]),
             'failed_profiles': len([r for r in results.values() if 'error' in r]),
             'training_parameters': self.training_config,
-            'profile_results': {}
+            'profile_results': {},
+            'environment': ENVIRONMENT,
+            'configuration_used': {
+                'data_bucket': DATA_BUCKET,
+                'model_bucket': MODEL_BUCKET,
+                'xgboost_params': self.training_config['xgboost_params'],
+                'cv_splits': self.training_config['cv_splits'],
+                'train_cutoff': self.training_config['train_cutoff']
+            }
         }
         
         # Add per-profile summary exactly as in original
@@ -645,13 +656,21 @@ class EnergyTrainingPipeline:
         return summary
     
     def _save_error_log(self, error_message):
-        """Save error log"""
+        """Save error log with environment information"""
+        from config import ENVIRONMENT, DATA_BUCKET, MODEL_BUCKET
+        
         error_log = {
             'timestamp': datetime.now(self.pacific_tz).isoformat(),
             'current_date': self.current_date,
             'error': error_message,
             'status': 'failed',
-            'xgboost_version': xgb.__version__
+            'xgboost_version': xgb.__version__,
+            'environment': ENVIRONMENT,
+            'configuration_used': {
+                'data_bucket': DATA_BUCKET,
+                'model_bucket': MODEL_BUCKET,
+                'training_config': self.training_config
+            }
         }
         
         # Save locally and upload to S3
@@ -663,7 +682,17 @@ class EnergyTrainingPipeline:
 def main():
     """Main entry point for training container"""
     try:
+        # Log environment information
+        from config import ENVIRONMENT, DEBUG_MODE, DATA_BUCKET, MODEL_BUCKET
+        logger.info("="*60)
+        logger.info("ENERGY FORECASTING TRAINING PIPELINE")
+        logger.info("="*60)
+        logger.info(f"Environment: {ENVIRONMENT}")
+        logger.info(f"Debug Mode: {DEBUG_MODE}")
+        logger.info(f"Data Bucket: {DATA_BUCKET}")
+        logger.info(f"Model Bucket: {MODEL_BUCKET}")
         logger.info(f"XGBoost version: {xgb.__version__}")
+        logger.info("="*60)
         
         pipeline = EnergyTrainingPipeline()
         pipeline.run_training()
@@ -673,6 +702,14 @@ def main():
         
     except Exception as e:
         logger.error(f"Training pipeline failed: {str(e)}")
+        logger.error("Configuration details:")
+        try:
+            from config import ENV_CONFIG
+            logger.error(f"Loaded config keys: {list(ENV_CONFIG.keys())}")
+            logger.error(f"Environment: {ENV_CONFIG.get('ENVIRONMENT', 'unknown')}")
+            logger.error(f"Training config: {ENV_CONFIG.get('TRAINING_CONFIG', {})}")
+        except Exception as config_error:
+            logger.error(f"Could not load config details: {config_error}")
         sys.exit(1)
 
 if __name__ == "__main__":

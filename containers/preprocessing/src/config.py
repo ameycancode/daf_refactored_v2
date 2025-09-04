@@ -10,6 +10,7 @@ import json
 import boto3
 import time
 import traceback
+from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 import logging
@@ -18,6 +19,76 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Load environment-specific configuration from JSON
+def load_environment_config():
+    """Load environment-specific configuration from JSON file"""
+    config_path = Path(__file__).parent / "config.json"
+    
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            env_config = json.load(f)
+            logger.info(f"Loaded environment configuration from: {config_path}")
+            logger.info(f"Environment: {env_config.get('ENVIRONMENT', 'unknown')}")
+            return env_config
+    else:
+        # Fallback for local development
+        logger.warning("config.json not found, using fallback configuration for local development")
+        return {
+            "ENVIRONMENT": "dev",
+            "AWS_REGION": "us-west-2",
+            "DEBUG_MODE": True,
+            "LOG_LEVEL": "DEBUG",
+            "DATA_BUCKET": "sdcp-dev-sagemaker-energy-forecasting-data",
+            "MODEL_BUCKET": "sdcp-dev-sagemaker-energy-forecasting-models",
+            "REDSHIFT_BI_SCHEMA": "edp_bi_dev",
+            "REDSHIFT_CLUSTER_IDENTIFIER": "sdcp-edp-backend-dev",
+            "REDSHIFT_DATABASE": "sdcp",
+            "REDSHIFT_DB_USER": "ds_service_user",
+            "REDSHIFT_INPUT_SCHEMA": "edp_cust_dev",
+            "REDSHIFT_INPUT_TABLE": "caiso_sqmd",
+            "REDSHIFT_OPERATIONAL_SCHEMA": "edp_forecasting_dev",
+            "REDSHIFT_OPERATIONAL_TABLE": "dayahead_load_forecasts",
+            "S3_PATHS": {
+                "raw_data": "archived_folders/forecasting/data/raw/",
+                "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
+                "model_input": "archived_folders/forecasting/data/xgboost/input/",
+                "temp_data": "temp/preprocessing/"
+            },
+            "PROCESSING_CONFIG": {
+                "chunk_size": 5000,
+                "parallel_processing": True,
+                "validation_enabled": True,
+                "debug_mode": True
+            },
+            "CUSTOMER_PROFILES": ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
+        }
+
+# Load configuration from JSON
+ENV_CONFIG = load_environment_config()
+
+# Export configuration values
+ENVIRONMENT = ENV_CONFIG["ENVIRONMENT"]
+AWS_REGION = ENV_CONFIG["AWS_REGION"]
+AWS_ACCOUNT_ID = ENV_CONFIG.get("AWS_ACCOUNT_ID", "")
+DEBUG_MODE = ENV_CONFIG["DEBUG_MODE"]
+LOG_LEVEL = ENV_CONFIG["LOG_LEVEL"]
+DATA_BUCKET = ENV_CONFIG["DATA_BUCKET"]
+MODEL_BUCKET = ENV_CONFIG["MODEL_BUCKET"]
+
+# Redshift Configuration
+REDSHIFT_BI_SCHEMA = ENV_CONFIG["REDSHIFT_BI_SCHEMA"]
+REDSHIFT_CLUSTER_IDENTIFIER = ENV_CONFIG["REDSHIFT_CLUSTER_IDENTIFIER"]
+REDSHIFT_DATABASE = ENV_CONFIG["REDSHIFT_DATABASE"]
+REDSHIFT_DB_USER = ENV_CONFIG["REDSHIFT_DB_USER"]
+REDSHIFT_INPUT_SCHEMA = ENV_CONFIG["REDSHIFT_INPUT_SCHEMA"]
+REDSHIFT_INPUT_TABLE = ENV_CONFIG["REDSHIFT_INPUT_TABLE"]
+REDSHIFT_OPERATIONAL_SCHEMA = ENV_CONFIG["REDSHIFT_OPERATIONAL_SCHEMA"]
+REDSHIFT_OPERATIONAL_TABLE = ENV_CONFIG["REDSHIFT_OPERATIONAL_TABLE"]
+
+# S3 Paths and Processing Config from JSON
+S3_PATHS = ENV_CONFIG.get("S3_PATHS", {})
+PROCESSING_CONFIG = ENV_CONFIG.get("PROCESSING_CONFIG", {})
+CUSTOMER_PROFILES = ENV_CONFIG.get("CUSTOMER_PROFILES", ["RNN", "RN", "M", "S", "AGR", "L", "A6"])
 
 class EnergyForecastingConfig:
     """Simplified configuration management for containers with Redshift support"""
@@ -29,78 +100,59 @@ class EnergyForecastingConfig:
         # Initialize boto3 clients
         try:
             self.s3_client = boto3.client('s3')
-            self.redshift_data_client = boto3.client('redshift-data', region_name='us-west-2')
-            self.region = boto3.Session().region_name
+            self.redshift_data_client = boto3.client('redshift-data', region_name=AWS_REGION)
+            self.region = boto3.Session().region_name or AWS_REGION
             self.account_id = boto3.client('sts').get_caller_identity()['Account']
             logger.info(f"AWS connection successful. Region: {self.region}, Account: {self.account_id}")
         except Exception as e:
             logger.warning(f"AWS connection failed: {str(e)}")
             self.s3_client = None
             self.redshift_data_client = None
-            self.region = "us-west-2"
-            self.account_id = "123456789012"
+            self.region = AWS_REGION
+            self.account_id = AWS_ACCOUNT_ID or "123456789012"
        
-        # Load configuration
-        self.config = self._load_configuration(config_file)
+        # Load configuration using JSON-based approach
+        self.config = self._load_configuration()
        
         logger.info(f"Configuration initialized for date: {self.current_date}")
+        logger.info(f"Environment: {ENVIRONMENT}")
+        logger.info(f"Data bucket: {DATA_BUCKET}")
+        logger.info(f"Redshift cluster: {REDSHIFT_CLUSTER_IDENTIFIER}")
    
-    def _load_configuration(self, config_file):
-        """Load configuration from file or use defaults"""
-        if config_file and os.path.exists(config_file):
-            try:
-                with open(config_file, 'r') as f:
-                    custom_config = json.load(f)
-                logger.info(f"Loaded custom configuration from: {config_file}")
-               
-                # Merge with defaults
-                default_config = self._get_default_config()
-                self._deep_merge(default_config, custom_config)
-                return default_config
-            except Exception as e:
-                logger.warning(f"Failed to load config file {config_file}: {str(e)}")
-       
-        # Use default configuration
-        logger.info("Using default configuration")
-        return self._get_default_config()
-   
-    def _deep_merge(self, base_dict, update_dict):
-        """Deep merge two dictionaries"""
-        for key, value in update_dict.items():
-            if isinstance(value, dict) and key in base_dict and isinstance(base_dict[key], dict):
-                self._deep_merge(base_dict[key], value)
-            else:
-                base_dict[key] = value
-   
-    def _get_default_config(self):
-        """Get default configuration matching original implementation with Redshift support"""
+    def _load_configuration(self):
+        """Load configuration using JSON-based approach"""
+        logger.info("Loading configuration from environment-specific JSON")
+        
         return {
-            # S3 Configuration (matches your original structure)
+            # S3 Configuration
             "s3": {
-                "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
-                "model_bucket": "sdcp-dev-sagemaker-energy-forecasting-models",
-                "raw_data_prefix": "archived_folders/forecasting/data/raw/",
-                "processed_data_prefix": "archived_folders/forecasting/data/xgboost/processed/",
-                "input_data_prefix": "archived_folders/forecasting/data/xgboost/input/",
-                "output_data_prefix": "archived_folders/forecasting/data/xgboost/output/",
+                "data_bucket": DATA_BUCKET,
+                "model_bucket": MODEL_BUCKET,
+                "raw_data_prefix": S3_PATHS.get("raw_data", "archived_folders/forecasting/data/raw/"),
+                "processed_data_prefix": S3_PATHS.get("processed_data", "archived_folders/forecasting/data/xgboost/processed/"),
+                "input_data_prefix": S3_PATHS.get("model_input", "archived_folders/forecasting/data/xgboost/input/"),
+                "output_data_prefix": S3_PATHS.get("output_data", "archived_folders/forecasting/data/xgboost/output/"),
                 "model_prefix": "xgboost/",
                 "train_results_prefix": "archived_folders/forecasting/data/xgboost/train_results/"
             },
             
             # Redshift Configuration
             "redshift": {
-                "database": "sdcp",
-                "cluster_identifier": "sdcp-edp-backend-dev",
-                "db_user": "ds_service_user",
-                "region": "us-west-2",
-                "schema": "edp_cust_dev",
-                "table": "caiso_sqmd",
+                "database": REDSHIFT_DATABASE,
+                "cluster_identifier": REDSHIFT_CLUSTER_IDENTIFIER,
+                "db_user": REDSHIFT_DB_USER,
+                "region": AWS_REGION,
+                "schema": REDSHIFT_INPUT_SCHEMA,
+                "table": REDSHIFT_INPUT_TABLE,
+                "bi_schema": REDSHIFT_BI_SCHEMA,
+                "operational_schema": REDSHIFT_OPERATIONAL_SCHEMA,
+                "operational_table": REDSHIFT_OPERATIONAL_TABLE,
                 "query_timeout_seconds": 1800,
-                "use_redshift": True,  # Toggle between Redshift and CSV
-                "data_reading_period_days": None # All data; 0.3 * 365  # ~109 days, configurable
+                "use_redshift": True,
+                "data_reading_period_days": None
             },
            
-            # Data Processing Configuration (from your original code)
+            # Data Processing Configuration
             "data_processing": {
                 "split_date": "2025-06-24",
                 "profile_start_dates": {
@@ -139,7 +191,7 @@ class EnergyForecastingConfig:
                 ]
             },
            
-            # Training Configuration (from your original code)
+            # Training Configuration
             "training": {
                 "train_cutoff": "2025-05-24",
                 "cv_splits": 10,
@@ -171,7 +223,7 @@ class EnergyForecastingConfig:
                 }
             },
            
-            # File naming patterns (from your original code)
+            # File naming patterns
             "file_patterns": {
                 "raw_files": {
                     "load_data": "SQMD.csv",
@@ -195,7 +247,7 @@ class EnergyForecastingConfig:
                 }
             },
            
-            # Container paths (SageMaker specific)
+            # Container paths
             "container_paths": {
                 "input_path": "/opt/ml/processing/input",
                 "output_path": "/opt/ml/processing/output",
@@ -218,7 +270,7 @@ class EnergyForecastingConfig:
         """Get data reading period in days"""
         return self.config["redshift"].get("data_reading_period_days", None)
    
-    # S3 Path Generators (unchanged from original)
+    # S3 Path Generators
     def get_s3_path(self, path_type, **kwargs):
         """Generate S3 paths based on configuration"""
         bucket = self.config["s3"]["data_bucket"]
@@ -278,7 +330,7 @@ class EnergyForecastingConfig:
         s3_key = s3_path.split('/', 3)[-1] + filename
         return s3_key
    
-    # Configuration getters (unchanged from original)
+    # Configuration getters
     def get_profiles(self):
         """Get all profile codes"""
         return list(self.config["data_processing"]["profile_mappings"].values())
@@ -303,7 +355,7 @@ class EnergyForecastingConfig:
         """Get data processing configuration"""
         return self.config["data_processing"]
    
-    # S3 bucket getters (unchanged from original)
+    # S3 bucket getters
     @property
     def data_bucket(self):
         return self.config["s3"]["data_bucket"]
@@ -560,18 +612,19 @@ class RedshiftDataManager:
 class MemoryOptimizedRedshiftDataManager(RedshiftDataManager):
     """Memory-optimized version for large datasets"""
     
-    def __init__(self, config: EnergyForecastingConfig):
+    def __init__(self, config):
         super().__init__(config)
-        self.chunk_size = int(os.getenv('CHUNK_SIZE', 50000))
-        self.memory_threshold = 0.8  # 80% memory usage threshold
+        self.chunk_size = PROCESSING_CONFIG.get('chunk_size', 50000)
+        self.memory_threshold = 0.8
         
     def query_sqmd_data_chunked(self, current_date=None, chunk_size=None):
-        """Query SQMD data in chunks to manage memory"""
+        """Query SQMD data in chunks with per-chunk processing"""
         try:
             if chunk_size is None:
                 chunk_size = self.chunk_size
                 
-            logger.info(f"Starting chunked query with chunk size: {chunk_size:,}")
+            logger.info(f"Starting optimized chunked query with per-chunk processing")
+            logger.info(f"Chunk size: {chunk_size:,}")
             
             # Get total row count first
             count_query = self._build_count_query(current_date)
@@ -581,14 +634,13 @@ class MemoryOptimizedRedshiftDataManager(RedshiftDataManager):
                 raise ValueError("No SQMD data available for the specified period")
                 
             logger.info(f"Total rows to process: {total_rows:,}")
-            logger.info(f"Count Query to process: {total_rows:,}")
             
             # Calculate number of chunks needed
             num_chunks = (total_rows + chunk_size - 1) // chunk_size
-            logger.info(f"Will process data in {num_chunks} chunks")
+            logger.info(f"Will process data in {num_chunks} chunks with per-chunk optimization")
             
-            # Process data in chunks
-            all_chunks = []
+            # Process data in chunks with per-chunk processing
+            processed_chunks = []
             for chunk_num in range(num_chunks):
                 offset = chunk_num * chunk_size
                 
@@ -597,43 +649,308 @@ class MemoryOptimizedRedshiftDataManager(RedshiftDataManager):
                 # Check memory before processing each chunk
                 self._check_memory_usage()
                 
+                # Get raw chunk
                 chunk_query = self._build_chunk_query(current_date, chunk_size, offset)
-                # if chunk_num < 2:
-                #     logger.info(f"Chunk Query to process: {chunk_query}")
-                chunk_df = self.execute_query(chunk_query)
+                raw_chunk = self.execute_query(chunk_query)
                 
-                if not chunk_df.empty:
-                    all_chunks.append(chunk_df)
-                    logger.info(f"Chunk {chunk_num + 1} processed: {len(chunk_df):,} rows")
-                else:
+                if raw_chunk.empty:
                     logger.warning(f"Chunk {chunk_num + 1} returned no data")
+                    continue
                 
-                # Force garbage collection after each chunk
+                # Per-chunk processing (stages 1-5)
+                processed_chunk = self._process_chunk_optimized(raw_chunk, chunk_num + 1)
+                
+                if not processed_chunk.empty:
+                    processed_chunks.append(processed_chunk)
+                    logger.info(f"Chunk {chunk_num + 1} processed: {len(processed_chunk):,} rows")
+                
+                # Clear raw chunk from memory
+                del raw_chunk
                 gc.collect()
             
-            if not all_chunks:
+            if not processed_chunks:
                 raise ValueError("No data retrieved from any chunks")
             
-            # Combine all chunks
-            logger.info("Combining all chunks...")
-            df_combined = pd.concat(all_chunks, ignore_index=True)
-
-            logger.info(f"Shape of combined dataframe: {df_combined.shape}")
+            # Combine processed chunks
+            logger.info("Combining all processed chunks...")
+            df_combined = pd.concat(processed_chunks, ignore_index=True)
             
             # Clear chunk data from memory
-            del all_chunks
+            del processed_chunks
             gc.collect()
             
             logger.info(f"Successfully combined all chunks: {len(df_combined):,} total rows")
-            return df_combined
+            
+            # Full-dataset processing (stages 6-8)
+            logger.info("Starting full-dataset processing (aggregation and final steps)...")
+            df_final = self._process_full_dataset(df_combined)
+            
+            # Clear combined data from memory
+            del df_combined
+            gc.collect()
+            
+            logger.info(f"Final processing completed: {len(df_final):,} records")
+            return df_final
             
         except Exception as e:
-            logger.error(f"Error in chunked query: {str(e)}")
+            logger.error(f"Error in optimized chunked query: {str(e)}")
             # Clean up memory on error
-            if 'all_chunks' in locals():
-                del all_chunks
+            for var_name in ['raw_chunk', 'processed_chunks', 'df_combined']:
+                if var_name in locals():
+                    del locals()[var_name]
             gc.collect()
             raise
+
+            # Stage 1: Process datetime columns
+            chunk_df = self._process_datetime_columns_chunk(chunk_df)
+            
+            # Stage 2: Create profile classifications  
+            chunk_df = self._create_profile_classifications_chunk(chunk_df)
+            
+            # Stage 3: Clean numeric data
+            chunk_df = self._clean_numeric_data_chunk(chunk_df)
+            
+            # Stage 4: Select required columns
+            chunk_df = self._select_required_columns_chunk(chunk_df)
+            
+            # Stage 5: Separate submissions (can be done per chunk)
+            df_final_chunk, df_initial_chunk = self._separate_submissions_chunk(chunk_df)
+            
+            # Add submission type back to chunks for later processing
+            df_final_chunk['submission_type'] = 'Final'
+            df_initial_chunk['submission_type'] = 'Initial'
+            
+            # Combine final and initial for this chunk
+            processed_chunk = pd.concat([df_final_chunk, df_initial_chunk], ignore_index=True)
+            
+            logger.info(f"  Chunk {chunk_num}: Per-chunk processing completed")
+            return processed_chunk
+            
+        except Exception as e:
+            logger.error(f"  Chunk {chunk_num}: Per-chunk processing failed: {str(e)}")
+            raise
+    
+    # Per-chunk processing methods (stages 1-5)
+    
+    def _process_datetime_columns_chunk(self, df):
+        """Optimized datetime processing for chunk"""
+        try:
+            # Check if we have the expected format in first few rows
+            sample_tradedate = str(df['tradedate'].iloc[0]) if not df.empty else ''
+            sample_tradetime = str(df['tradetime'].iloc[0]) if not df.empty else ''
+            
+            # Most efficient approach for your format (tradedate: "2021-03-03", tradetime: "00")
+            if len(sample_tradetime) <= 2:  # Your case: tradetime is just hour
+                # Vectorized operation - much faster than apply
+                df['tradetime_formatted'] = df['tradetime'].astype(str).str.zfill(2) + ':00:00'
+                df['TradeDateTime'] = pd.to_datetime(
+                    df['tradedate'].astype(str) + ' ' + df['tradetime_formatted'], 
+                    format='%Y-%m-%d %H:%M:%S',
+                    errors='coerce'
+                )
+                df.drop('tradetime_formatted', axis=1, inplace=True)
+            else:
+                # Standard format
+                df['TradeDateTime'] = pd.to_datetime(
+                    df['tradedate'].astype(str) + ' ' + df['tradetime'].astype(str), 
+                    format='%Y-%m-%d %H:%M:%S',
+                    errors='coerce'
+                )
+            
+            # Handle any NaT values
+            nat_count = df['TradeDateTime'].isna().sum()
+            if nat_count > 0:
+                logger.warning(f"    Found {nat_count} invalid datetime values in chunk, removing...")
+                df = df.dropna(subset=['TradeDateTime'])
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"    Chunk datetime processing failed: {str(e)}")
+            raise
+    
+    def _create_profile_classifications_chunk(self, df):
+        """Create profile and NEM classifications for chunk"""
+        df['RateGroup'] = df['rategroup'].astype(str)
+        
+        # Vectorized operations
+        df['NEM'] = df['RateGroup'].str.startswith(('NEM', 'SBP')).map({True: 'NEM', False: 'Non_NEM'})
+        df['Profile'] = df.apply(
+            lambda row: row['loadprofile'] + '_' + row['NEM'] if row['loadprofile'] == 'RES' else row['loadprofile'], 
+            axis=1
+        )
+        
+        return df
+    
+    def _clean_numeric_data_chunk(self, df):
+        """Clean numeric data for chunk"""
+        # Convert to numeric with error handling
+        df['lossadjustedload'] = pd.to_numeric(df['lossadjustedload'], errors='coerce')
+        df['metercount'] = pd.to_numeric(df['metercount'], errors='coerce')
+        
+        # Remove rows with invalid numeric values
+        invalid_count = df[['lossadjustedload', 'metercount']].isna().any(axis=1).sum()
+        if invalid_count > 0:
+            logger.warning(f"    Found {invalid_count} rows with invalid numeric values in chunk, removing...")
+            df = df.dropna(subset=['lossadjustedload', 'metercount'])
+        
+        return df
+    
+    def _select_required_columns_chunk(self, df):
+        """Select only required columns to reduce memory usage"""
+        required_columns = ['TradeDateTime', 'tradedate', 'tradetime', 'Profile', 'lossadjustedload', 'metercount', 'submission']
+        df = df[required_columns].copy()
+        
+        # Rename columns
+        df.columns = ['TradeDateTime', 'TradeDate', 'TradeTime', 'Profile', 'LossAdjustedLoad', 'MeterCount', 'Submission']
+        return df
+    
+    def _separate_submissions_chunk(self, df):
+        """Separate Final and Initial submissions for chunk"""
+        df_final = df[df['Submission'] == 'Final'].copy()
+        df_initial = df[df['Submission'] == 'Initial'].copy()
+        
+        return df_final, df_initial
+    
+    # Full-dataset processing methods (stages 6-8)  
+    
+    def _process_full_dataset(self, df_combined):
+        """Process full combined dataset (stages 6-8)"""
+        try:
+            logger.info("Starting full-dataset aggregation and processing...")
+            
+            # Separate final and initial submissions from combined data
+            df_final = df_combined[df_combined['submission_type'] == 'Final'].copy()
+            df_initial = df_combined[df_combined['submission_type'] == 'Initial'].copy()
+            
+            # Remove submission_type column
+            df_final.drop('submission_type', axis=1, inplace=True)
+            df_initial.drop('submission_type', axis=1, inplace=True)
+            
+            # Clear combined data from memory
+            del df_combined
+            gc.collect()
+            
+            # Stage 6: Aggregate hourly data
+            logger.info("Stage 6: Aggregating hourly data...")
+            df_hour_final = self._aggregate_hourly_data_optimized(df_final, 'final')
+            df_hour_initial = self._aggregate_hourly_data_optimized(df_initial, 'initial')
+            
+            # Clear submission dataframes from memory
+            del df_final, df_initial
+            gc.collect()
+            
+            # Stage 7: Calculate metrics and merge
+            logger.info("Stage 7: Calculating metrics and merging...")
+            df_processed = self._calculate_metrics_and_merge_optimized(df_hour_final, df_hour_initial)
+            
+            # Clear hourly dataframes from memory  
+            del df_hour_final, df_hour_initial
+            gc.collect()
+            
+            # Stage 8: Extend dataset and add features
+            logger.info("Stage 8: Extending dataset and adding features...")
+            df_extended = self._extend_dataset_optimized(df_processed)
+            del df_processed
+            gc.collect()
+            
+            df_final = self._add_date_features_optimized(df_extended)
+            del df_extended
+            gc.collect()
+            
+            logger.info("Full-dataset processing completed successfully")
+            return df_final
+            
+        except Exception as e:
+            logger.error(f"Full-dataset processing failed: {str(e)}")
+            raise
+    
+    def _aggregate_hourly_data_optimized(self, df, submission_type):
+        """Memory-optimized hourly aggregation"""
+        if df.empty:
+            logger.warning(f"No data to aggregate for {submission_type} submissions")
+            return pd.DataFrame(columns=['TradeDateTime', 'Profile', 'LoadHour', 'Count'])
+        
+        # Group by hourly with memory-optimized aggregation
+        df_hour = df.groupby(['TradeDateTime', 'Profile']).agg(
+            LoadHour=('LossAdjustedLoad', 'sum'),
+            Count=('MeterCount', 'sum')
+        ).reset_index()
+        
+        logger.info(f"Aggregated {submission_type} data: {len(df_hour)} hourly records")
+        return df_hour
+    
+    def _calculate_metrics_and_merge_optimized(self, df_hour_final, df_hour_initial):
+        """Memory-optimized metrics calculation and merging"""
+        # Calculate Load_Per_Meter for both datasets
+        df_hour_final['Load_Per_Meter'] = df_hour_final['LoadHour'] / df_hour_final['Count']
+        df_hour_initial['Load_Per_Meter'] = df_hour_initial['LoadHour'] / df_hour_initial['Count']
+        
+        # Replace inf values with NaN
+        df_hour_final['Load_Per_Meter'] = df_hour_final['Load_Per_Meter'].replace([np.inf, -np.inf], np.nan)
+        df_hour_initial['Load_Per_Meter'] = df_hour_initial['Load_Per_Meter'].replace([np.inf, -np.inf], np.nan)
+        
+        # Rename initial columns
+        df_hour_initial = df_hour_initial.rename(columns={
+            'LoadHour': 'LoadHour_I',
+            'Count': 'Count_I',
+            'Load_Per_Meter': 'Load_Per_Meter_I'
+        })
+        
+        # Merge final and initial data
+        df_merged = pd.merge(df_hour_final, df_hour_initial, on=['TradeDateTime', 'Profile'], how='right')
+        df_processed = df_merged[['TradeDateTime', 'Profile', 'Count', 'Load_Per_Meter', 'Count_I', 'Load_Per_Meter_I']].copy()
+        
+        return df_processed
+    
+    def _extend_dataset_optimized(self, df):
+        """Memory-optimized dataset extension"""
+        max_date = df['TradeDateTime'].max()
+        extended_dates = pd.date_range(start=max_date + pd.Timedelta(hours=1), periods=40 * 24, freq='h')
+        profiles = df['Profile'].unique()
+        
+        extended_df = pd.DataFrame({'TradeDateTime': extended_dates}).merge(
+            pd.DataFrame(profiles, columns=['Profile']), how='cross'
+        )
+        
+        df_extended = pd.concat([df, extended_df], ignore_index=True)
+        logger.info(f"Extended dataset: {len(df_extended)} records")
+        
+        return df_extended
+    
+    def _add_date_features_optimized(self, df):
+        """Memory-optimized date feature addition"""
+        df['Year'] = df['TradeDateTime'].dt.year
+        df['Month'] = df['TradeDateTime'].dt.month
+        df['Day'] = df['TradeDateTime'].dt.day
+        df['Hour'] = df['TradeDateTime'].dt.hour
+        df['Weekday'] = df['TradeDateTime'].dt.day_name()
+        df['Season'] = df['Month'].map({
+            1: 'Winter', 2: 'Winter', 3: 'Winter', 4: 'Winter', 5: 'Winter',
+            6: 'Summer', 7: 'Summer', 8: 'Summer', 9: 'Summer', 10: 'Summer',
+            11: 'Winter', 12: 'Winter'
+        })
+        
+        # Add holidays and workday features
+        holidays = [
+            "2021-01-01", "2021-02-15", "2021-05-31", "2021-07-05", "2021-09-06",
+            "2021-11-11", "2021-11-25", "2021-12-25",
+            "2022-01-01", "2022-02-21", "2022-05-30", "2022-07-04", "2022-09-05", 
+            "2022-11-11", "2022-11-24", "2022-12-26",
+            "2023-01-02", "2023-02-20", "2023-05-29", "2023-07-04", "2023-09-04",
+            "2023-11-11", "2023-11-23", "2023-12-25",
+            "2024-01-01", "2024-02-19", "2024-05-27", "2024-07-04", "2024-09-02",
+            "2024-11-11", "2024-11-28", "2024-12-25",
+            "2025-01-01", "2025-02-17", "2025-05-26", "2025-07-04", "2025-09-01",
+            "2025-11-11", "2025-11-27", "2025-12-25"
+        ]
+        
+        df['TradeDate'] = df['TradeDateTime'].dt.date.astype(str)
+        df['Holiday'] = df['TradeDate'].isin(holidays).astype(int)
+        df['Workday'] = ((df['Holiday'] == 0) & (~df['Weekday'].isin(['Saturday', 'Sunday']))).astype(int)
+        
+        logger.info("Added date features and holiday information")
+        return df
     
     def _build_count_query(self, current_date=None):
         """Build query to get total row count"""
@@ -710,37 +1027,46 @@ class MemoryOptimizedRedshiftDataManager(RedshiftDataManager):
                 
         except Exception as e:
             logger.warning(f"Could not check memory usage: {str(e)}")
-
-
+ 
+ 
 class MemoryOptimizedEnergyForecastingConfig(EnergyForecastingConfig):
     """Memory-optimized configuration with environment variable support"""
     
     def __init__(self, config_file=None):
         super().__init__(config_file)
         
+        # Apply memory optimization settings from JSON config
+        self._apply_memory_optimization_settings()
+        
         # Override with environment variables if available
         self._apply_environment_overrides()
     
+    def _apply_memory_optimization_settings(self):
+        """Apply memory optimization settings from JSON configuration"""
+        processing_config = PROCESSING_CONFIG
+        
+        # Set chunk size based on environment and JSON config
+        default_chunk_size = processing_config.get('chunk_size', 10000)
+        if ENVIRONMENT == 'dev':
+            default_chunk_size = 5000
+        elif ENVIRONMENT == 'prod':
+            default_chunk_size = 20000
+            
+        self.config['redshift']['chunk_size'] = default_chunk_size
+        
+        # Enable memory optimization if specified
+        if processing_config.get('parallel_processing', True):
+            self.config['memory_optimization'] = {
+                'enabled': True,
+                'chunk_processing': True,
+                'garbage_collection': True,
+                'memory_monitoring': True
+            }
+            
+        logger.info(f"Memory optimization applied: chunk_size={default_chunk_size}")
+    
     def _apply_environment_overrides(self):
         """Apply environment variable overrides for container optimization"""
-        
-        # # Data reading period override
-        # env_data_period = os.getenv('DATA_READING_PERIOD_DAYS')
-        # if env_data_period:
-        #     try:
-        #         self.config['redshift']['data_reading_period_days'] = float(env_data_period)
-        #         logger.info(f"Override: data_reading_period_days = {env_data_period}")
-        #     except ValueError:
-        #         logger.warning(f"Invalid DATA_READING_PERIOD_DAYS: {env_data_period}")
-        
-        # # Query limit override
-        # env_query_limit = os.getenv('QUERY_LIMIT')
-        # if env_query_limit:
-        #     try:
-        #         self.config['redshift']['query_limit'] = int(env_query_limit)
-        #         logger.info(f"Override: query_limit = {env_query_limit}")
-        #     except ValueError:
-        #         logger.warning(f"Invalid QUERY_LIMIT: {env_query_limit}")
         
         # Chunk size for memory optimization
         env_chunk_size = os.getenv('CHUNK_SIZE')
@@ -772,10 +1098,10 @@ class MemoryOptimizedEnergyForecastingConfig(EnergyForecastingConfig):
     def is_memory_optimization_enabled(self):
         """Check if memory optimization is enabled"""
         return self.config.get('memory_optimization', {}).get('enabled', False)
-
-
+ 
+ 
 class S3FileManager:
-    """S3 file manager using configuration (unchanged from original)"""
+    """S3 file manager using configuration"""
    
     def __init__(self, config: EnergyForecastingConfig):
         self.config = config

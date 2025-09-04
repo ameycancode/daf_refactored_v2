@@ -9,6 +9,76 @@ import boto3
 from datetime import datetime
 import pytz
 import logging
+from pathlib import Path
+
+# Load environment-specific configuration from JSON
+def load_environment_config():
+    """Load environment-specific configuration from JSON file"""
+    config_path = Path(__file__).parent / "config.json"
+    
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            env_config = json.load(f)
+            logger.info(f"Loaded environment configuration from: {config_path}")
+            logger.info(f"Environment: {env_config.get('ENVIRONMENT', 'unknown')}")
+            return env_config
+    else:
+        # Fallback for local development
+        logger.warning("config.json not found, using fallback configuration for local development")
+        return {
+            "ENVIRONMENT": "dev",
+            "AWS_REGION": "us-west-2",
+            "DEBUG_MODE": True,
+            "LOG_LEVEL": "DEBUG",
+            "DATA_BUCKET": "sdcp-dev-sagemaker-energy-forecasting-data",
+            "MODEL_BUCKET": "sdcp-dev-sagemaker-energy-forecasting-models",
+            "TRAINING_CONFIG": {
+                "xgboost": {
+                    "n_estimators": 50,
+                    "max_depth": 6,
+                    "learning_rate": 0.1
+                }
+            },
+            "MODEL_REGISTRY_CONFIG": {
+                "model_package_group_name": "energy-forecasting-models",
+                "performance_thresholds": {
+                    "RNN": {"min_r2": 0.85, "max_mape": 5.0, "max_rmse": 0.1},
+                    "RN": {"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12},
+                    "M": {"min_r2": 0.85, "max_mape": 4.0, "max_rmse": 0.08},
+                    "S": {"min_r2": 0.82, "max_mape": 5.5, "max_rmse": 0.10},
+                    "AGR": {"min_r2": 0.80, "max_mape": 7.0, "max_rmse": 0.15},
+                    "L": {"min_r2": 0.75, "max_mape": 8.0, "max_rmse": 0.20},
+                    "A6": {"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12}
+                }
+            },
+            "S3_PATHS": {
+                "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
+                "model_input": "archived_folders/forecasting/data/xgboost/input/",
+                "model_output": "archived_folders/forecasting/models/",
+                "temp_models": "temp/training/"
+            },
+            "CUSTOMER_PROFILES": ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
+        }
+
+# Load configuration from JSON
+ENV_CONFIG = load_environment_config()
+
+# Export configuration values
+ENVIRONMENT = ENV_CONFIG["ENVIRONMENT"]
+AWS_REGION = ENV_CONFIG["AWS_REGION"]
+AWS_ACCOUNT_ID = ENV_CONFIG.get("AWS_ACCOUNT_ID", "")
+DEBUG_MODE = ENV_CONFIG["DEBUG_MODE"]
+LOG_LEVEL = ENV_CONFIG["LOG_LEVEL"]
+DATA_BUCKET = ENV_CONFIG["DATA_BUCKET"]
+MODEL_BUCKET = ENV_CONFIG["MODEL_BUCKET"]
+
+# Training Configuration
+TRAINING_CONFIG = ENV_CONFIG["TRAINING_CONFIG"]
+MODEL_REGISTRY_CONFIG = ENV_CONFIG.get("MODEL_REGISTRY_CONFIG", {})
+
+# S3 Paths and Customer Profiles from JSON
+S3_PATHS = ENV_CONFIG.get("S3_PATHS", {})
+CUSTOMER_PROFILES = ENV_CONFIG.get("CUSTOMER_PROFILES", ["RNN", "RN", "M", "S", "AGR", "L", "A6"])
 
 logger = logging.getLogger(__name__)
 
@@ -22,58 +92,36 @@ class EnergyForecastingConfig:
         # Initialize boto3 clients
         try:
             self.s3_client = boto3.client('s3')
-            self.region = boto3.Session().region_name
+            self.region = boto3.Session().region_name or AWS_REGION
             self.account_id = boto3.client('sts').get_caller_identity()['Account']
             logger.info(f"AWS connection successful. Region: {self.region}, Account: {self.account_id}")
         except Exception as e:
             logger.warning(f"AWS connection failed: {str(e)}")
             self.s3_client = None
-            self.region = "us-west-2"
-            self.account_id = "123456789012"
+            self.region = AWS_REGION
+            self.account_id = AWS_ACCOUNT_ID or "123456789012"
        
-        # Load configuration
-        self.config = self._load_configuration(config_file)
+        # Load configuration using JSON-based approach
+        self.config = self._load_configuration()
        
         logger.info(f"Configuration initialized for date: {self.current_date}")
+        logger.info(f"Environment: {ENVIRONMENT}")
+        logger.info(f"Data bucket: {DATA_BUCKET}")
+        logger.info(f"Model bucket: {MODEL_BUCKET}")
    
-    def _load_configuration(self, config_file):
-        """Load configuration from file or use defaults"""
-        if config_file and os.path.exists(config_file):
-            try:
-                with open(config_file, 'r') as f:
-                    custom_config = json.load(f)
-                logger.info(f"Loaded custom configuration from: {config_file}")
-               
-                # Merge with defaults
-                default_config = self._get_default_config()
-                self._deep_merge(default_config, custom_config)
-                return default_config
-            except Exception as e:
-                logger.warning(f"Failed to load config file {config_file}: {str(e)}")
-       
-        # Use default configuration
-        logger.info("Using default configuration")
-        return self._get_default_config()
-   
-    def _deep_merge(self, base_dict, update_dict):
-        """Deep merge two dictionaries"""
-        for key, value in update_dict.items():
-            if isinstance(value, dict) and key in base_dict and isinstance(base_dict[key], dict):
-                self._deep_merge(base_dict[key], value)
-            else:
-                base_dict[key] = value
-   
-    def _get_default_config(self):
-        """Get default configuration matching original implementation"""
+    def _load_configuration(self):
+        """Load configuration using JSON-based approach"""
+        logger.info("Loading configuration from environment-specific JSON")
+        
         return {
             # S3 Configuration (matches your original structure)
             "s3": {
-                "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
-                "model_bucket": "sdcp-dev-sagemaker-energy-forecasting-models",
+                "data_bucket": DATA_BUCKET,
+                "model_bucket": MODEL_BUCKET,
                 "raw_data_prefix": "archived_folders/forecasting/data/raw/",
-                "processed_data_prefix": "archived_folders/forecasting/data/xgboost/processed/",
-                "input_data_prefix": "archived_folders/forecasting/data/xgboost/input/",
-                "output_data_prefix": "archived_folders/forecasting/data/xgboost/output/",
+                "processed_data_prefix": S3_PATHS.get("processed_data", "archived_folders/forecasting/data/xgboost/processed/"),
+                "input_data_prefix": S3_PATHS.get("model_input", "archived_folders/forecasting/data/xgboost/input/"),
+                "output_data_prefix": S3_PATHS.get("output_data", "archived_folders/forecasting/data/xgboost/output/"),
                 "model_prefix": "xgboost/",
                 "train_results_prefix": "archived_folders/forecasting/data/xgboost/train_results/"
             },
@@ -121,11 +169,11 @@ class EnergyForecastingConfig:
             "training": {
                 "train_cutoff": "2025-05-24",
                 "cv_splits": 10,
-                "xgboost_params": {
+                "xgboost_params": TRAINING_CONFIG.get("xgboost", {
                     "n_estimators": [150, 200, 300],
                     "learning_rate": [0.03, 0.05, 0.1, 0.2],
                     "max_depth": [4, 5, 6, 7]
-                },
+                }),
                 "performance_threshold": None,
                 "random_state": 42
             },

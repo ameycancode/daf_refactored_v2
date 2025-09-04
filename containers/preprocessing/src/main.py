@@ -50,31 +50,31 @@ class EnergyPreprocessingPipeline:
             logger.info("Step 1: Processing Load Data...")
             df_load = self._process_load_data()
            
-            # Step 2: Process Temperature Data (unchanged)
+            # Step 2: Process Temperature Data
             logger.info("Step 2: Processing Temperature Data...")
             df_temperature = self._process_temperature_data()
            
-            # Step 3: Merge Load and Temperature (unchanged)
+            # Step 3: Merge Load and Temperature
             logger.info("Step 3: Merging Load and Temperature Data...")
             df_merged = self._merge_load_temperature(df_load, df_temperature)
            
-            # Step 4: Generate Data Profiles (unchanged)
+            # Step 4: Generate Data Profiles
             logger.info("Step 4: Generating Data by Profile...")
             profile_dfs = self._generate_data_profile(df_merged)
            
-            # Step 5: Create Lag Features (unchanged)
+            # Step 5: Create Lag Features
             logger.info("Step 5: Creating Lag Features...")
             lagged_dfs = self._save_lagged_profiles(profile_dfs)
            
-            # Step 6: Replace Count Data (unchanged)
+            # Step 6: Replace Count Data
             logger.info("Step 6: Replacing Count Data...")
             replaced_dfs = self._replace_count_i(lagged_dfs)
            
-            # Step 7: Add Radiation for RN (unchanged)
+            # Step 7: Add Radiation for RN
             logger.info("Step 7: Adding Radiation Data for RN...")
             final_dfs = self._add_radiation_to_df_RN(replaced_dfs)
            
-            # Step 8: Train-Test Split (unchanged)
+            # Step 8: Train-Test Split
             logger.info("Step 8: Performing Train-Test Split...")
             self._train_test_split(final_dfs)
            
@@ -270,24 +270,24 @@ class EnergyPreprocessingPipeline:
     def _clean_numeric_data(self, df):
         """Enhanced numeric data cleaning"""
         logger.info("Converting numeric columns to proper types...")
-        logger.info(f"LossAdjustedLoad dtype before: {df['LossAdjustedLoad'].dtype}")
-        logger.info(f"MeterCount dtype before: {df['MeterCount'].dtype}")
+        logger.info(f"LossAdjustedLoad dtype before: {df['lossadjustedload'].dtype}")
+        logger.info(f"MeterCount dtype before: {df['metercount'].dtype}")
        
         # Convert to numeric, handling any non-numeric values
-        df['LossAdjustedLoad'] = pd.to_numeric(df['LossAdjustedLoad'], errors='coerce')
-        df['MeterCount'] = pd.to_numeric(df['MeterCount'], errors='coerce')
+        df['lossadjustedload'] = pd.to_numeric(df['lossadjustedload'], errors='coerce')
+        df['metercount'] = pd.to_numeric(df['metercount'], errors='coerce')
        
         # Remove rows with invalid numeric values
-        invalid_load = df['LossAdjustedLoad'].isna().sum()
-        invalid_meter = df['MeterCount'].isna().sum()
+        invalid_load = df['lossadjustedload'].isna().sum()
+        invalid_meter = df['metercount'].isna().sum()
        
         if invalid_load > 0 or invalid_meter > 0:
             logger.warning(f"Found {invalid_load} invalid LossAdjustedLoad values and {invalid_meter} invalid MeterCount values")
-            df = df.dropna(subset=['LossAdjustedLoad', 'MeterCount'])
+            df = df.dropna(subset=['lossadjustedload', 'metercount'])
             logger.info(f"Removed invalid rows, remaining: {len(df)} rows")
        
-        logger.info(f"LossAdjustedLoad dtype after: {df['LossAdjustedLoad'].dtype}")
-        logger.info(f"MeterCount dtype after: {df['MeterCount'].dtype}")
+        logger.info(f"LossAdjustedLoad dtype after: {df['lossadjustedload'].dtype}")
+        logger.info(f"MeterCount dtype after: {df['metercount'].dtype}")
         
         return df
     
@@ -371,7 +371,7 @@ class EnergyPreprocessingPipeline:
         return df
    
     def _process_temperature_data(self):
-        """Process temperature data (unchanged from original)"""
+        """Process temperature data"""
         input_file = os.path.join(self.paths['input_path'], self.config.get_file_path('temperature_data'))
        
         if not os.path.exists(input_file):
@@ -405,7 +405,7 @@ class EnergyPreprocessingPipeline:
         return df_t
    
     def _merge_load_temperature(self, df_load, df_temperature):
-        """Merge load and temperature data (unchanged from original)"""
+        """Merge load and temperature data"""
         # Merge data
         df = pd.merge(df_load, df_temperature, on=['TradeDate', 'Hour'], how='left')
        
@@ -428,7 +428,7 @@ class EnergyPreprocessingPipeline:
         return df
    
     def _generate_data_profile(self, df):
-        """Generate data profiles (unchanged from original)"""
+        """Generate data profiles"""
         # Replace null values
         df['Count'] = df['Count'].fillna(df['Count_I'])
         df['Load'] = df['Load'].fillna(df['Load_I'])
@@ -444,7 +444,7 @@ class EnergyPreprocessingPipeline:
         return profile_dfs
    
     def _save_lagged_profiles(self, profile_dfs):
-        """Create lag features (unchanged from original)"""
+        """Create lag features"""
         profile_start_dates = self.config.get_data_processing_config()['profile_start_dates']
         lag_config = self.config.get_data_processing_config()['lag_features']
        
@@ -478,7 +478,7 @@ class EnergyPreprocessingPipeline:
         return lagged_dfs
    
     def _replace_count_i(self, lagged_dfs):
-        """Replace Count_I (unchanged from original)"""
+        """Replace Count_I"""
         updated_dfs = {}
        
         for profile, df in lagged_dfs.items():
@@ -507,7 +507,7 @@ class EnergyPreprocessingPipeline:
         return updated_dfs
    
     def _add_radiation_to_df_RN(self, updated_dfs):
-        """Add radiation data to RN profile (unchanged from original)"""
+        """Add radiation data to RN profile"""
         radiation_file = os.path.join(self.paths['input_path'], self.config.get_file_path('radiation_data'))
        
         if not os.path.exists(radiation_file):
@@ -546,7 +546,7 @@ class EnergyPreprocessingPipeline:
         return updated_dfs
    
     def _train_test_split(self, final_dfs):
-        """Perform train-test split (unchanged from original)"""
+        """Perform train-test split"""
         split_date = pd.to_datetime(self.config.get_data_processing_config()['split_date'])
        
         for profile, df in final_dfs.items():
@@ -575,7 +575,7 @@ class EnergyPreprocessingPipeline:
             test_s3_key = f"{self.config.config['s3']['processed_data_prefix']}train_test_split/test/{profile}_test_{self.current_date}{suffix}.csv"
             self.s3_manager.save_and_upload_dataframe(test_set, test_local, test_s3_key)
            
-            # Save test set to input directory for prediction container (exactly as in original)
+            # Save test set to input directory for prediction container
             input_local = os.path.join(
                 self.paths['output_path'], 'input',
                 f"{profile}_test_{self.current_date}{suffix}.csv"
@@ -587,6 +587,8 @@ class EnergyPreprocessingPipeline:
    
     def _save_processing_summary(self, start_time):
         """Save processing summary with enhanced information"""
+        from config import ENVIRONMENT, DATA_BUCKET, REDSHIFT_CLUSTER_IDENTIFIER
+        
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
        
@@ -601,9 +603,11 @@ class EnergyPreprocessingPipeline:
             "redshift_enabled": self.config.is_redshift_enabled(),
             "data_reading_period_days": self.config.get_data_reading_period_days(),
             "status": "completed",
+            "environment": ENVIRONMENT,
             "configuration_used": {
-                "data_bucket": self.config.data_bucket,
+                "data_bucket": DATA_BUCKET,
                 "model_bucket": self.config.model_bucket,
+                "redshift_cluster": REDSHIFT_CLUSTER_IDENTIFIER,
                 "lag_features": self.config.get_data_processing_config()['lag_features'],
                 "redshift_config": self.config.get_redshift_config() if self.config.is_redshift_enabled() else None
             }
@@ -619,12 +623,16 @@ class EnergyPreprocessingPipeline:
    
     def _save_error_log(self, error_message):
         """Save error log with enhanced information"""
+        from config import ENVIRONMENT, REDSHIFT_CLUSTER_IDENTIFIER
+        
         error_log = {
             "timestamp": datetime.now().isoformat(),
             "current_date": self.current_date,
             "error": error_message,
             "data_source": "redshift" if self.config.is_redshift_enabled() else "csv",
             "redshift_enabled": self.config.is_redshift_enabled(),
+            "environment": ENVIRONMENT,
+            "redshift_cluster": REDSHIFT_CLUSTER_IDENTIFIER,
             "status": "failed"
         }
        
@@ -673,11 +681,8 @@ class MemoryOptimizedEnergyPreprocessingPipeline(EnergyPreprocessingPipeline):
             if df.empty:
                 raise ValueError("No SQMD data retrieved from Redshift")
             
-            logger.info(f"Successfully read {len(df):,} rows from Redshift")
-            
-            # Process data in memory-efficient way
-            df = self._memory_efficient_data_processing(df)
-            
+            logger.info(f"Successfully processed {len(df):,} rows of SQMD data from Redshift")
+ 
             self._log_memory_status("After data processing")
             
             return df
@@ -687,108 +692,6 @@ class MemoryOptimizedEnergyPreprocessingPipeline(EnergyPreprocessingPipeline):
             # Clean up memory on error
             gc.collect()
             raise
-    
-    def _memory_efficient_data_processing(self, df):
-        """Process data with memory optimization"""
-        logger.info("Starting memory-efficient data processing...")
-        
-        # Process in stages to minimize memory usage
-        
-        # Stage 1: Datetime processing
-        logger.info("Stage 1: Processing datetime columns...")
-        df = self._process_datetime_columns(df)
-        gc.collect()
-        
-        # Stage 2: Create classifications  
-        logger.info("Stage 2: Creating profile classifications...")
-        df = self._create_profile_classifications(df)
-        gc.collect()
-        
-        # Stage 3: Clean numeric data
-        logger.info("Stage 3: Cleaning numeric data...")
-        df = self._clean_numeric_data(df)
-        gc.collect()
-        
-        # Stage 4: Select and rename columns (reduce memory footprint)
-        logger.info("Stage 4: Selecting required columns...")
-        df = self._select_required_columns(df)
-        gc.collect()
-        
-        # Stage 5: Process submissions
-        logger.info("Stage 5: Processing submissions...")
-        df_final, df_initial = self._separate_submissions(df)
-        
-        # Clear original dataframe from memory
-        del df
-        gc.collect()
-        
-        # Stage 6: Aggregate data
-        logger.info("Stage 6: Aggregating hourly data...")
-        df_hour_final = self._aggregate_hourly_data(df_final, 'final')
-        df_hour_initial = self._aggregate_hourly_data(df_initial, 'initial')
-        
-        # Clear submission dataframes from memory
-        del df_final, df_initial
-        gc.collect()
-        
-        # Stage 7: Calculate metrics and merge
-        logger.info("Stage 7: Calculating metrics and merging...")
-        df_processed = self._calculate_metrics_and_merge(df_hour_final, df_hour_initial)
-        
-        # Clear hourly dataframes from memory
-        del df_hour_final, df_hour_initial
-        gc.collect()
-        
-        # Stage 8: Extend dataset and add features
-        logger.info("Stage 8: Extending dataset and adding features...")
-        df_extended = self._extend_dataset(df_processed)
-        del df_processed
-        gc.collect()
-        
-        df_final = self._add_date_features(df_extended)
-        del df_extended
-        gc.collect()
-        
-        logger.info(f"Memory-efficient processing completed: {len(df_final):,} records")
-        self._log_memory_status("After memory-efficient processing")
-        
-        return df_final
-    
-    def _create_profile_classifications(self, df):
-        """Create profile and NEM classifications"""
-        df['RateGroup'] = df['rategroup'].astype(str)
-        df['NEM'] = df['RateGroup'].apply(lambda x: 'NEM' if x.startswith(('NEM', 'SBP')) else 'Non_NEM')
-        df['Profile'] = df.apply(lambda row: row['loadprofile'] + '_' + row['NEM'] if row['loadprofile'] == 'RES' else row['loadprofile'], axis=1)
-        return df
-    
-    def _select_required_columns(self, df):
-        """Select only required columns to reduce memory usage"""
-        required_columns = ['TradeDateTime', 'tradedate', 'tradetime', 'Profile', 'lossadjustedload', 'metercount', 'submission']
-        df = df[required_columns].copy()
-        
-        # Rename columns
-        df.columns = ['TradeDateTime', 'TradeDate', 'TradeTime', 'Profile', 'LossAdjustedLoad', 'MeterCount', 'Submission']
-        return df
-    
-    def _calculate_metrics_and_merge(self, df_hour_final, df_hour_initial):
-        """Calculate load per meter and merge final/initial data"""
-        
-        # Calculate Load_Per_Meter for both datasets
-        df_hour_final['Load_Per_Meter'] = self._safe_division(df_hour_final['LoadHour'], df_hour_final['Count'])
-        df_hour_initial['Load_Per_Meter'] = self._safe_division(df_hour_initial['LoadHour'], df_hour_initial['Count'])
-        
-        # Rename initial columns
-        df_hour_initial = df_hour_initial.rename(columns={
-            'LoadHour': 'LoadHour_I',
-            'Count': 'Count_I', 
-            'Load_Per_Meter': 'Load_Per_Meter_I'
-        })
-        
-        # Merge final and initial data
-        df_merged = pd.merge(df_hour_final, df_hour_initial, on=['TradeDateTime', 'Profile'], how='right')
-        df_processed = df_merged[['TradeDateTime', 'Profile', 'Count', 'Load_Per_Meter', 'Count_I', 'Load_Per_Meter_I']].copy()
-        
-        return df_processed
     
     def _log_memory_status(self, stage):
         """Log current memory usage"""
@@ -869,6 +772,17 @@ class MemoryOptimizedEnergyPreprocessingPipeline(EnergyPreprocessingPipeline):
 def main():
     """Main entry point for preprocessing container"""
     try:
+        # Log environment information
+        from config import ENVIRONMENT, DEBUG_MODE, DATA_BUCKET, REDSHIFT_CLUSTER_IDENTIFIER
+        logger.info("="*60)
+        logger.info("ENERGY FORECASTING PREPROCESSING PIPELINE")
+        logger.info("="*60)
+        logger.info(f"Environment: {ENVIRONMENT}")
+        logger.info(f"Debug Mode: {DEBUG_MODE}")
+        logger.info(f"Data Bucket: {DATA_BUCKET}")
+        logger.info(f"Redshift Cluster: {REDSHIFT_CLUSTER_IDENTIFIER}")
+        logger.info("="*60)
+        
         # Use memory-optimized pipeline if environment variable is set
         if os.getenv('MEMORY_OPTIMIZATION') == '1':
             logger.info("Using memory-optimized processing pipeline")
@@ -876,12 +790,19 @@ def main():
         else:
             logger.info("Using standard processing pipeline")
             pipeline = EnergyPreprocessingPipeline()
-
+ 
         pipeline.run_preprocessing()
         logger.info("Preprocessing pipeline completed successfully!")
         sys.exit(0)
     except Exception as e:
         logger.error(f"Preprocessing pipeline failed: {str(e)}")
+        logger.error("Configuration details:")
+        try:
+            from config import ENV_CONFIG
+            logger.error(f"Loaded config keys: {list(ENV_CONFIG.keys())}")
+            logger.error(f"Environment: {ENV_CONFIG.get('ENVIRONMENT', 'unknown')}")
+        except Exception as config_error:
+            logger.error(f"Could not load config details: {config_error}")
         sys.exit(1)
 
 

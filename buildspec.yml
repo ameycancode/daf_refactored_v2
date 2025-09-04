@@ -20,7 +20,10 @@ phases:
     commands:
       - echo Build started on `date`
       - echo Building container images...
-     
+
+      - echo "=== GENERATING ENVIRONMENT-SPECIFIC CONFIGURATIONS ==="
+      - python deployment/container_config_manager.py --environment $ENVIRONMENT --generate-configs
+      
       # Build preprocessing container
       - echo "Building preprocessing container..."
       - cd containers/preprocessing

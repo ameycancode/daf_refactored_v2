@@ -81,14 +81,14 @@ class ContainerConfigManager:
         configs_generated = {}
         
         # Generate preprocessing container config
-        preprocessing_config = self._generate_preprocessing_config()
-        preprocessing_path = "containers/preprocessing/src/config.py"
+        preprocessing_config = self._generate_preprocessing_json()
+        preprocessing_path = "containers/preprocessing/src/config.json"
         self._write_config_file(preprocessing_path, preprocessing_config)
         configs_generated['preprocessing'] = preprocessing_path
         
         # Generate training container config
-        training_config = self._generate_training_config()
-        training_path = "containers/training/src/config.py"
+        training_config = self._generate_training_json()
+        training_path = "containers/training/src/config.json"
         self._write_config_file(training_path, training_config)
         configs_generated['training'] = training_path
         
@@ -101,192 +101,136 @@ class ContainerConfigManager:
         self.logger.info(f"Generated {len(configs_generated)} container configurations")
         return configs_generated
     
-    def _generate_preprocessing_config(self) -> str:
-        """Generate preprocessing container configuration"""
+    def _generate_preprocessing_json(self) -> Dict[str, Any]:
+        """Generate preprocessing container JSON configuration"""
         container_config = self.config['containers']['preprocessing']
         s3_config = self.config['s3']
+        redshift_config = self.config.get('redshift', {})
         
-        config_content = f'''#!/usr/bin/env python3
-"""
-Energy Forecasting Preprocessing Configuration
-Auto-generated for environment: {self.environment}
-Generated at: {datetime.now().isoformat()}
-"""
-
-import os
-import logging
-
-# Environment Configuration
-ENVIRONMENT = "{self.environment}"
-AWS_REGION = "{self.region}"
-AWS_ACCOUNT_ID = "{self.account_id}"
-
-# Logging Configuration
-DEBUG_MODE = {container_config.get('debug_mode', False)}
-LOG_LEVEL = "{container_config.get('log_level', 'INFO')}"
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('energy-forecasting-preprocessing')
-
-# S3 Configuration
-DATA_BUCKET = "{s3_config['data_bucket']}"
-MODEL_BUCKET = "{s3_config['model_bucket']}"
-
-# Data Paths
-S3_PATHS = {{
-    "raw_data": "archived_folders/forecasting/data/raw/",
-    "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
-    "model_input": "archived_folders/forecasting/data/xgboost/input/",
-    "temp_data": "temp/preprocessing/"
-}}
-
-# Processing Configuration
-PROCESSING_CONFIG = {{
-    "chunk_size": 10000,
-    "parallel_processing": True,
-    "validation_enabled": True,
-    "debug_mode": DEBUG_MODE
-}}
-
-# Customer Profiles
-CUSTOMER_PROFILES = ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
-
-# Environment-specific settings
-if ENVIRONMENT == "dev":
-    PROCESSING_CONFIG["chunk_size"] = 5000
-    PROCESSING_CONFIG["validation_enabled"] = True
-elif ENVIRONMENT == "prod":
-    PROCESSING_CONFIG["chunk_size"] = 20000
-    PROCESSING_CONFIG["validation_enabled"] = False
-
-# Runtime environment variable override support
-def get_config_value(key: str, default_value):
-    """Get configuration value with environment variable override"""
-    env_var = f"ENERGY_FORECASTING_{{key.upper()}}"
-    return os.environ.get(env_var, default_value)
-
-# Apply environment overrides
-DATA_BUCKET = get_config_value("data_bucket", DATA_BUCKET)
-MODEL_BUCKET = get_config_value("model_bucket", MODEL_BUCKET)
-LOG_LEVEL = get_config_value("log_level", LOG_LEVEL)
-
-logger.info(f"Preprocessing configuration loaded for environment: {{ENVIRONMENT}}")
-logger.info(f"Data bucket: {{DATA_BUCKET}}")
-logger.info(f"Model bucket: {{MODEL_BUCKET}}")
-logger.debug(f"Processing config: {{PROCESSING_CONFIG}}")
-'''
-        return config_content
+        config_json = {
+            # Environment Configuration
+            "ENVIRONMENT": self.environment,
+            "AWS_REGION": self.region,
+            "AWS_ACCOUNT_ID": self.account_id,
+            
+            # Logging Configuration
+            "DEBUG_MODE": container_config.get('debug_mode', False),
+            "LOG_LEVEL": container_config.get('log_level', 'INFO'),
+            
+            # S3 Configuration
+            "DATA_BUCKET": s3_config['data_bucket'],
+            "MODEL_BUCKET": s3_config['model_bucket'],
+            
+            # Redshift Configuration
+            "REDSHIFT_BI_SCHEMA": redshift_config.get('bi_schema', 'edp_bi'),
+            "REDSHIFT_CLUSTER_IDENTIFIER": redshift_config.get('cluster_identifier', 'sdcp-edp-backend'),
+            "REDSHIFT_DATABASE": redshift_config.get('database', 'sdcp'),
+            "REDSHIFT_DB_USER": redshift_config.get('db_user', 'ds_service_user'),
+            "REDSHIFT_INPUT_SCHEMA": redshift_config.get('input_schema', 'edp_cust'),
+            "REDSHIFT_INPUT_TABLE": redshift_config.get('input_table', 'caiso_sqmd'),
+            "REDSHIFT_OPERATIONAL_SCHEMA": redshift_config.get('operational_schema', 'edp_forecasting'),
+            "REDSHIFT_OPERATIONAL_TABLE": redshift_config.get('operational_table', 'dayahead_load_forecasts'),
+            
+            # Data Paths
+            "S3_PATHS": {
+                "raw_data": "archived_folders/forecasting/data/raw/",
+                "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
+                "model_input": "archived_folders/forecasting/data/xgboost/input/",
+                "temp_data": "temp/preprocessing/"
+            },
+            
+            # Processing Configuration
+            "PROCESSING_CONFIG": {
+                "chunk_size": 10000 if self.environment != "dev" else 5000,
+                "parallel_processing": True,
+                "validation_enabled": True,
+                "debug_mode": container_config.get('debug_mode', False)
+            },
+            
+            # Customer Profiles
+            "CUSTOMER_PROFILES": ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
+        }
+        
+        return config_json
     
-    def _generate_training_config(self) -> str:
-        """Generate training container configuration"""
+    def _generate_training_json(self) -> Dict[str, Any]:
+        """Generate training container JSON configuration"""
         container_config = self.config['containers']['training']
         s3_config = self.config['s3']
         
-        config_content = f'''#!/usr/bin/env python3
-"""
-Energy Forecasting Training Configuration
-Auto-generated for environment: {self.environment}
-Generated at: {datetime.now().isoformat()}
-"""
+        # Environment-specific training parameters
+        n_estimators = 50 if self.environment == "dev" else (100 if self.environment == "preprod" else 200)
+        early_stopping = 5 if self.environment == "dev" else (10 if self.environment == "preprod" else 20)
+        
+        config_json = {
+            # Environment Configuration
+            "ENVIRONMENT": self.environment,
+            "AWS_REGION": self.region,
+            "AWS_ACCOUNT_ID": self.account_id,
+            
+            # Logging Configuration
+            "DEBUG_MODE": container_config.get('debug_mode', False),
+            "LOG_LEVEL": container_config.get('log_level', 'INFO'),
+            
+            # S3 Configuration
+            "DATA_BUCKET": s3_config['data_bucket'],
+            "MODEL_BUCKET": s3_config['model_bucket'],
+            
+            # Model Training Configuration
+            "TRAINING_CONFIG": {
+                "xgboost": {
+                    "n_estimators": n_estimators,
+                    "max_depth": 6,
+                    "learning_rate": 0.1,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                    "random_state": 42
+                },
+                "validation_split": 0.2,
+                "early_stopping_rounds": early_stopping,
+                "eval_metric": "rmse"
+            },
+            
+            # Model Registry Configuration
+            "MODEL_REGISTRY_CONFIG": {
+                "model_package_group_name": "energy-forecasting-models",
+                "approval_status": "Approved",
+                "performance_thresholds": {
+                    "RNN": {"min_r2": 0.85, "max_mape": 5.0, "max_rmse": 0.1},
+                    "RN": {"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12},
+                    "M": {"min_r2": 0.85, "max_mape": 4.0, "max_rmse": 0.08},
+                    "S": {"min_r2": 0.82, "max_mape": 5.5, "max_rmse": 0.10},
+                    "AGR": {"min_r2": 0.80, "max_mape": 7.0, "max_rmse": 0.15},
+                    "L": {"min_r2": 0.75, "max_mape": 8.0, "max_rmse": 0.20},
+                    "A6": {"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12}
+                }
+            },
+            
+            # Data Paths
+            "S3_PATHS": {
+                "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
+                "model_input": "archived_folders/forecasting/data/xgboost/input/",
+                "model_output": "archived_folders/forecasting/models/",
+                "temp_models": "temp/training/"
+            },
+            
+            # Customer Profiles
+            "CUSTOMER_PROFILES": ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
+        }
+        
+        return config_json
 
-import os
-import logging
-
-# Environment Configuration
-ENVIRONMENT = "{self.environment}"
-AWS_REGION = "{self.region}"
-AWS_ACCOUNT_ID = "{self.account_id}"
-
-# Logging Configuration
-DEBUG_MODE = {container_config.get('debug_mode', False)}
-LOG_LEVEL = "{container_config.get('log_level', 'INFO')}"
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('energy-forecasting-training')
-
-# S3 Configuration
-DATA_BUCKET = "{s3_config['data_bucket']}"
-MODEL_BUCKET = "{s3_config['model_bucket']}"
-
-# Model Training Configuration
-TRAINING_CONFIG = {{
-    "xgboost": {{
-        "n_estimators": 100,
-        "max_depth": 6,
-        "learning_rate": 0.1,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "random_state": 42
-    }},
-    "validation_split": 0.2,
-    "early_stopping_rounds": 10,
-    "eval_metric": "rmse"
-}}
-
-# Model Registry Configuration
-MODEL_REGISTRY_CONFIG = {{
-    "model_package_group_name": "energy-forecasting-models",
-    "approval_status": "Approved",
-    "performance_thresholds": {{
-        "RNN": {{"min_r2": 0.85, "max_mape": 5.0, "max_rmse": 0.1}},
-        "RN": {{"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12}},
-        "M": {{"min_r2": 0.85, "max_mape": 4.0, "max_rmse": 0.08}},
-        "S": {{"min_r2": 0.82, "max_mape": 5.5, "max_rmse": 0.10}},
-        "AGR": {{"min_r2": 0.80, "max_mape": 7.0, "max_rmse": 0.15}},
-        "L": {{"min_r2": 0.75, "max_mape": 8.0, "max_rmse": 0.20}},
-        "A6": {{"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12}}
-    }}
-}}
-
-# Data Paths
-S3_PATHS = {{
-    "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
-    "model_input": "archived_folders/forecasting/data/xgboost/input/",
-    "model_output": "archived_folders/forecasting/models/",
-    "temp_models": "temp/training/"
-}}
-
-# Customer Profiles
-CUSTOMER_PROFILES = ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
-
-# Environment-specific training parameters
-if ENVIRONMENT == "dev":
-    TRAINING_CONFIG["xgboost"]["n_estimators"] = 50  # Faster training for dev
-    TRAINING_CONFIG["early_stopping_rounds"] = 5
-elif ENVIRONMENT == "preprod":
-    TRAINING_CONFIG["xgboost"]["n_estimators"] = 100
-    TRAINING_CONFIG["early_stopping_rounds"] = 10
-elif ENVIRONMENT == "prod":
-    TRAINING_CONFIG["xgboost"]["n_estimators"] = 200  # More thorough training for prod
-    TRAINING_CONFIG["early_stopping_rounds"] = 20
-
-# Runtime environment variable override support
-def get_config_value(key: str, default_value):
-    """Get configuration value with environment variable override"""
-    env_var = f"ENERGY_FORECASTING_{{key.upper()}}"
-    return os.environ.get(env_var, default_value)
-
-# Apply environment overrides
-DATA_BUCKET = get_config_value("data_bucket", DATA_BUCKET)
-MODEL_BUCKET = get_config_value("model_bucket", MODEL_BUCKET)
-LOG_LEVEL = get_config_value("log_level", LOG_LEVEL)
-
-logger.info(f"Training configuration loaded for environment: {{ENVIRONMENT}}")
-logger.info(f"Data bucket: {{DATA_BUCKET}}")
-logger.info(f"Model bucket: {{MODEL_BUCKET}}")
-logger.debug(f"Training config: {{TRAINING_CONFIG}}")
-logger.debug(f"Model registry config: {{MODEL_REGISTRY_CONFIG}}")
-'''
-        return config_content
-    
+    def _write_json_file(self, file_path: str, content: Dict[str, Any]) -> None:
+        """Write JSON configuration file"""
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Write JSON configuration file
+        with open(file_path, 'w') as f:
+            json.dump(content, f, indent=2)
+        
+        self.logger.info(f"Generated JSON configuration file: {file_path}")
+        
     def _generate_buildspec_config(self) -> str:
         """Generate buildspec.yml with environment-aware configuration"""
         buildspec_content = f'''version: 0.2

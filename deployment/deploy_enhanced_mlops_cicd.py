@@ -261,7 +261,14 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
             )
             
             configs_generated = config_manager.generate_container_configs()
-            self.logger.info(f"Generated {len(configs_generated)} container configurations")
+            self.logger.info(f"Generated {len(configs_generated)} container JSON configurations")
+            
+            # Validate JSON configurations
+            validation_results = config_manager.validate_container_configs()
+            if validation_results["errors"]:
+                self.logger.warning("JSON configuration validation issues found:")
+                for error in validation_results["errors"]:
+                    self.logger.warning(f"  - {error}")
             
             for config_name, config_path in configs_generated.items():
                 self.logger.info(f"  {config_name}: {config_path}")

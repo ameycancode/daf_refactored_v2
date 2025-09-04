@@ -42,3 +42,14 @@ cost_optimization:
   delete_endpoints_after_test: true
   preserve_s3_data: true
   endpoint_timeout_minutes: 20
+
+# Redshift Configuration
+redshift:
+  bi_schema: edp_bi_preprod
+  cluster_identifier: sdcp-edp-backend-preprod
+  database: sdcp
+  db_user: ds_service_user
+  input_schema: edp_cust_preprod
+  input_table: caiso_sqmd
+  operational_schema: edp_forecasting_preprod
+  operational_table: dayahead_load_forecasts_sdcp
