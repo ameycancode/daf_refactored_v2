@@ -74,17 +74,17 @@ jobs:
 
           case $VALIDATION_TYPE in
             "pre-deployment")
-              python deployment/validate_environment.py \
+              python sdcp_code/deployment/validate_environment.py \
                 --environment $ENVIRONMENT \
                 --pre-deployment-check
               ;;
             "post-deployment")
-              python deployment/validate_environment.py \
+              python sdcp_code/deployment/validate_environment.py \
                 --environment $ENVIRONMENT \
                 --post-deployment-check
               ;;
             "complete-integration")
-              python deployment/validate_environment.py \
+              python sdcp_code/deployment/validate_environment.py \
                 --environment $ENVIRONMENT \
                 --complete-integration-check
               ;;

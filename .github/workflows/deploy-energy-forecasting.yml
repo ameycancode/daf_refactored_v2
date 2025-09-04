@@ -35,16 +35,16 @@ on:
   push:
     branches: [main, develop]
     paths:
-      - 'containers/**'
-      - 'deployment/**'
-      - 'lambda-functions/**'
-      - 'infrastructure/**'
+      - 'sdcp_code/containers/**'
+      - 'sdcp_code/deployment/**'
+      - 'sdcp_code/lambda-functions/**'
+      - 'sdcp_code/infrastructure/**'
   pull_request:
     branches: [main, develop]
     paths:
-      - 'containers/**'
-      - 'deployment/**'
-      - 'lambda-functions/**'
+      - 'sdcp_code/containers/**'
+      - 'sdcp_code/deployment/**'
+      - 'sdcp_code/lambda-functions/**'
 
 env:
   AWS_REGION: us-west-2
@@ -199,7 +199,7 @@ jobs:
 
       - name: 🏗️ Create Container Configuration
         run: |
-          python deployment/container_config_manager.py \
+          python sdcp_code/deployment/container_config_manager.py \
             --environment ${{ needs.determine_environment.outputs.environment }} \
             --generate-configs
 
@@ -252,7 +252,7 @@ jobs:
       - name: ✅ Validate Environment
         run: |
           echo "=== ENVIRONMENT VALIDATION ==="
-          python deployment/validate_environment.py \
+          python sdcp_code/deployment/validate_environment.py \
             --environment ${{ needs.determine_environment.outputs.environment }} \
             --pre-deployment-check
 
@@ -269,7 +269,7 @@ jobs:
           echo "Pipeline Name: ${{ needs.determine_environment.outputs.pipeline_name }}"
           
           # Run enhanced deployment with CI/CD parameters
-          python deployment/deploy_enhanced_mlops.py \
+          python sdcp_code/deployment/deploy_enhanced_mlops_cicd.py \
             --environment $ENVIRONMENT \
             --region ${{ env.AWS_REGION }} \
             --ci-cd-mode \
@@ -333,7 +333,7 @@ jobs:
           echo "Environment: $ENVIRONMENT"
           echo "Testing all 7 profiles (sequential execution)"
           
-          python scripts/test_training_pipeline.py \
+          python sdcp_code/scripts/test_training_pipeline_cicd.py \
             --environment $ENVIRONMENT \
             --region ${{ env.AWS_REGION }} \
             --all-profiles \
@@ -407,7 +407,7 @@ jobs:
           echo "Test Profiles: $TEST_PROFILES"
           echo "Timeout: $TIMEOUT_MINUTES minutes"
           
-          python scripts/test_enhanced_prediction_pipeline.py \
+          python sdcp_code/scripts/test_enhanced_prediction_pipeline_cicd.py \
             --environment $ENVIRONMENT \
             --region ${{ env.AWS_REGION }} \
             --profiles "$TEST_PROFILES" \
@@ -460,7 +460,7 @@ jobs:
           echo "=== COMPLETE INTEGRATION VALIDATION ==="
           echo "Environment: $ENVIRONMENT"
           
-          python deployment/validate_environment.py \
+          python sdcp_code/deployment/validate_environment.py \
             --environment $ENVIRONMENT \
             --complete-integration-check
 
@@ -512,7 +512,7 @@ jobs:
           echo "Environment: $ENVIRONMENT"
           echo "Cleaning up test resources (preserving S3 data)"
           
-          python deployment/cleanup_enhanced_mlops.py \
+          python sdcp_code/deployment/cleanup_enhanced_mlops.py \
             --environment $ENVIRONMENT \
             --cleanup-test-resources \
             --preserve-s3 \

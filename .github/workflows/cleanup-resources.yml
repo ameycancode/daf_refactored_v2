@@ -85,19 +85,19 @@ jobs:
 
           case $CLEANUP_TYPE in
             "test-resources")
-              python deployment/cleanup_enhanced_mlops.py \
+              python sdcp_code/deployment/cleanup_enhanced_mlops.py \
                 --environment $ENVIRONMENT \
                 --cleanup-test-resources \
                 --preserve-s3
               ;;
             "endpoints-only")
-              python deployment/cleanup_enhanced_mlops.py \
+              python sdcp_code/deployment/cleanup_enhanced_mlops.py \
                 --environment $ENVIRONMENT \
                 --endpoints-only \
                 --preserve-s3
               ;;
             "complete-pipeline")
-              python deployment/cleanup_enhanced_mlops.py \
+              python sdcp_code/deployment/cleanup_enhanced_mlops.py \
                 --environment $ENVIRONMENT \
                 --complete-cleanup \
                 $([ "$PRESERVE_S3" = "true" ] && echo "--preserve-s3")

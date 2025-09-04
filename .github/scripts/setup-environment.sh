@@ -106,7 +106,7 @@ if aws codebuild batch-get-projects --names "$CODEBUILD_PROJECT" --query 'projec
     echo "✅ CodeBuild project already exists: $CODEBUILD_PROJECT"
 else
     echo "🔨 Creating CodeBuild project: $CODEBUILD_PROJECT"
-    python3 scripts/build_via_codebuild.py --create-only --region "$AWS_REGION"
+    python3 sdcp_code/scripts/build_via_codebuild.py --create-only --region "$AWS_REGION"
     echo "✅ CodeBuild project created: $CODEBUILD_PROJECT"
 fi
 
