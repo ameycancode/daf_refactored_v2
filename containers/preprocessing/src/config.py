@@ -4,6 +4,8 @@ Container-ready version with Redshift integration
 """
 
 import os
+import gc
+import psutil
 import json
 import boto3
 import time
@@ -11,8 +13,11 @@ import traceback
 from datetime import datetime, timedelta
 import pytz
 import logging
+import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
+
 
 class EnergyForecastingConfig:
     """Simplified configuration management for containers with Redshift support"""
@@ -551,6 +556,222 @@ class RedshiftDataManager:
             logger.error(f"Error querying SQMD data: {e}")
             logger.error(traceback.format_exc())
             raise
+
+class MemoryOptimizedRedshiftDataManager(RedshiftDataManager):
+    """Memory-optimized version for large datasets"""
+    
+    def __init__(self, config: EnergyForecastingConfig):
+        super().__init__(config)
+        self.chunk_size = int(os.getenv('CHUNK_SIZE', 50000))
+        self.memory_threshold = 0.8  # 80% memory usage threshold
+        
+    def query_sqmd_data_chunked(self, current_date=None, chunk_size=None):
+        """Query SQMD data in chunks to manage memory"""
+        try:
+            if chunk_size is None:
+                chunk_size = self.chunk_size
+                
+            logger.info(f"Starting chunked query with chunk size: {chunk_size:,}")
+            
+            # Get total row count first
+            count_query = self._build_count_query(current_date)
+            total_rows = self._get_total_row_count(count_query)
+            
+            if total_rows == 0:
+                raise ValueError("No SQMD data available for the specified period")
+                
+            logger.info(f"Total rows to process: {total_rows:,}")
+            logger.info(f"Count Query to process: {total_rows:,}")
+            
+            # Calculate number of chunks needed
+            num_chunks = (total_rows + chunk_size - 1) // chunk_size
+            logger.info(f"Will process data in {num_chunks} chunks")
+            
+            # Process data in chunks
+            all_chunks = []
+            for chunk_num in range(num_chunks):
+                offset = chunk_num * chunk_size
+                
+                logger.info(f"Processing chunk {chunk_num + 1}/{num_chunks} (rows {offset:,} to {min(offset + chunk_size, total_rows):,})")
+                
+                # Check memory before processing each chunk
+                self._check_memory_usage()
+                
+                chunk_query = self._build_chunk_query(current_date, chunk_size, offset)
+                # if chunk_num < 2:
+                #     logger.info(f"Chunk Query to process: {chunk_query}")
+                chunk_df = self.execute_query(chunk_query)
+                
+                if not chunk_df.empty:
+                    all_chunks.append(chunk_df)
+                    logger.info(f"Chunk {chunk_num + 1} processed: {len(chunk_df):,} rows")
+                else:
+                    logger.warning(f"Chunk {chunk_num + 1} returned no data")
+                
+                # Force garbage collection after each chunk
+                gc.collect()
+            
+            if not all_chunks:
+                raise ValueError("No data retrieved from any chunks")
+            
+            # Combine all chunks
+            logger.info("Combining all chunks...")
+            df_combined = pd.concat(all_chunks, ignore_index=True)
+
+            logger.info(f"Shape of combined dataframe: {df_combined.shape}")
+            
+            # Clear chunk data from memory
+            del all_chunks
+            gc.collect()
+            
+            logger.info(f"Successfully combined all chunks: {len(df_combined):,} total rows")
+            return df_combined
+            
+        except Exception as e:
+            logger.error(f"Error in chunked query: {str(e)}")
+            # Clean up memory on error
+            if 'all_chunks' in locals():
+                del all_chunks
+            gc.collect()
+            raise
+    
+    def _build_count_query(self, current_date=None):
+        """Build query to get total row count"""
+        schema_name = self.redshift_config['schema']
+        table_name = self.redshift_config['table']
+        
+        if current_date is None:
+            current_date = datetime.now()
+        
+        data_period_days = self.config.get_data_reading_period_days()
+        
+        if data_period_days:
+            start_date = current_date - timedelta(days=data_period_days)
+            where_clause = f"WHERE tradedatelocal >= '{start_date.strftime('%Y-%m-%d')}'"
+        else:
+            where_clause = ""
+        
+        return f"SELECT COUNT(*) as total_rows FROM {schema_name}.{table_name} {where_clause}"
+    
+    def _get_total_row_count(self, count_query):
+        """Get total row count"""
+        try:
+            result_df = self.execute_query(count_query)
+            total_rows = int(result_df.iloc[0, 0])
+            return total_rows
+        except Exception as e:
+            logger.error(f"Error getting row count: {str(e)}")
+            # Fallback: assume large dataset and use chunking anyway
+            return 1000000  # Default assumption
+    
+    def _build_chunk_query(self, current_date=None, limit=50000, offset=0):
+        """Build query for a specific chunk"""
+        schema_name = self.redshift_config['schema']
+        table_name = self.redshift_config['table']
+        
+        if current_date is None:
+            current_date = datetime.now()
+        
+        data_period_days = self.config.get_data_reading_period_days()
+        
+        if data_period_days:
+            start_date = current_date - timedelta(days=data_period_days)
+            where_clause = f"WHERE tradedatelocal >= '{start_date.strftime('%Y-%m-%d')}'"
+        else:
+            where_clause = ""
+        
+        return f"""
+        SELECT
+            tradedatelocal as tradedate,
+            tradehourstartlocal as tradetime,
+            loadprofile, rategroup, baseload, lossadjustedload, metercount,
+            loadbl, loadlal, loadmetercount, genbl, genlal, genmetercount,
+            submission, createddate as created
+        FROM {schema_name}.{table_name}
+        {where_clause}
+        ORDER BY tradedatelocal, tradehourstartlocal, loadprofile
+        LIMIT {limit} OFFSET {offset}
+        """
+    
+    def _check_memory_usage(self):
+        """Check current memory usage and warn if high"""
+        try:
+            memory_percent = psutil.virtual_memory().percent / 100
+            available_gb = psutil.virtual_memory().available / (1024**3)
+            
+            logger.info(f"Memory usage: {memory_percent:.1%}, Available: {available_gb:.1f} GB")
+            
+            if memory_percent > self.memory_threshold:
+                logger.warning(f"High memory usage detected: {memory_percent:.1%}")
+                logger.warning("Consider reducing chunk size or upgrading instance type")
+                
+                # Force aggressive garbage collection
+                gc.collect()
+                
+        except Exception as e:
+            logger.warning(f"Could not check memory usage: {str(e)}")
+
+
+class MemoryOptimizedEnergyForecastingConfig(EnergyForecastingConfig):
+    """Memory-optimized configuration with environment variable support"""
+    
+    def __init__(self, config_file=None):
+        super().__init__(config_file)
+        
+        # Override with environment variables if available
+        self._apply_environment_overrides()
+    
+    def _apply_environment_overrides(self):
+        """Apply environment variable overrides for container optimization"""
+        
+        # # Data reading period override
+        # env_data_period = os.getenv('DATA_READING_PERIOD_DAYS')
+        # if env_data_period:
+        #     try:
+        #         self.config['redshift']['data_reading_period_days'] = float(env_data_period)
+        #         logger.info(f"Override: data_reading_period_days = {env_data_period}")
+        #     except ValueError:
+        #         logger.warning(f"Invalid DATA_READING_PERIOD_DAYS: {env_data_period}")
+        
+        # # Query limit override
+        # env_query_limit = os.getenv('QUERY_LIMIT')
+        # if env_query_limit:
+        #     try:
+        #         self.config['redshift']['query_limit'] = int(env_query_limit)
+        #         logger.info(f"Override: query_limit = {env_query_limit}")
+        #     except ValueError:
+        #         logger.warning(f"Invalid QUERY_LIMIT: {env_query_limit}")
+        
+        # Chunk size for memory optimization
+        env_chunk_size = os.getenv('CHUNK_SIZE')
+        if env_chunk_size:
+            try:
+                self.config['redshift']['chunk_size'] = int(env_chunk_size)
+                logger.info(f"Override: chunk_size = {env_chunk_size}")
+            except ValueError:
+                logger.warning(f"Invalid CHUNK_SIZE: {env_chunk_size}")
+        
+        # Memory optimization mode
+        if os.getenv('MEMORY_OPTIMIZATION') == '1':
+            logger.info("Memory optimization mode enabled")
+            self.config['memory_optimization'] = {
+                'enabled': True,
+                'chunk_processing': True,
+                'garbage_collection': True,
+                'memory_monitoring': True
+            }
+    
+    def get_query_limit(self):
+        """Get query limit for large datasets"""
+        return self.config['redshift'].get('query_limit', None)
+    
+    def get_chunk_size(self):
+        """Get chunk size for memory optimization"""
+        return self.config['redshift'].get('chunk_size', 50000)
+    
+    def is_memory_optimization_enabled(self):
+        """Check if memory optimization is enabled"""
+        return self.config.get('memory_optimization', {}).get('enabled', False)
 
 
 class S3FileManager:

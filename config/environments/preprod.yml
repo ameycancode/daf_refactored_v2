@@ -1,0 +1,44 @@
+# Environment Configuration - config/environments/preprod.yml
+environment: preprod
+aws_account_id: "{{ AWS_ACCOUNT_ID }}"
+aws_region: us-west-2
+
+# S3 Configuration
+s3:
+  data_bucket: sdcp-preprod-sagemaker-energy-forecasting-data
+  model_bucket: sdcp-preprod-sagemaker-energy-forecasting-models
+  
+# IAM Roles
+iam:
+  sagemaker_role: sdcp-preprod-sagemaker-energy-forecasting-datascientist-role
+  lambda_role: sdcp-preprod-sagemaker-energy-forecasting-lambda-role
+
+# Resource Naming
+resources:
+  pipeline_name: energy-forecasting-mlops-preprod
+  lambda_prefix: energy-forecasting-preprod
+  step_functions_prefix: energy-forecasting-preprod
+  ecr_prefix: energy
+
+# Container Configuration
+containers:
+  preprocessing:
+    environment: preprod
+    debug_mode: false
+    log_level: INFO
+  training:
+    environment: preprod
+    debug_mode: false
+    log_level: INFO
+
+# Testing Configuration
+testing:
+  default_profiles: ["RNN", "RN", "M"]
+  timeout_minutes: 45
+  cleanup_after_test: true
+
+# Cost Optimization
+cost_optimization:
+  delete_endpoints_after_test: true
+  preserve_s3_data: true
+  endpoint_timeout_minutes: 20

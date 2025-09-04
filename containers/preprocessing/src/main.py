@@ -5,6 +5,8 @@ Enhanced with Redshift integration and improved data processing
 """
 
 import os
+import gc
+import psutil
 import sys
 import pandas as pd
 import numpy as np
@@ -20,7 +22,8 @@ logger = logging.getLogger(__name__)
 # Add src directory to path
 sys.path.append('/opt/ml/processing/code/src')
 
-from config import EnergyForecastingConfig, S3FileManager, RedshiftDataManager
+from config import EnergyForecastingConfig, S3FileManager, RedshiftDataManager, MemoryOptimizedRedshiftDataManager, MemoryOptimizedEnergyForecastingConfig
+
 
 class EnergyPreprocessingPipeline:
     def __init__(self):
@@ -632,10 +635,248 @@ class EnergyPreprocessingPipeline:
         self.s3_manager.save_and_upload_file(error_log, local_file, s3_key)
 
 
+class MemoryOptimizedEnergyPreprocessingPipeline(EnergyPreprocessingPipeline):
+    """Memory-optimized preprocessing pipeline for large datasets"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # Use memory-optimized configuration and managers
+        if os.getenv('MEMORY_OPTIMIZATION') == '1':
+            logger.info("Initializing memory-optimized pipeline...")
+            self.config = MemoryOptimizedEnergyForecastingConfig()
+            self.redshift_manager = MemoryOptimizedRedshiftDataManager(self.config)
+            self.memory_optimization = True
+        else:
+            self.memory_optimization = False
+        
+        # Memory monitoring
+        self._log_memory_status("Pipeline initialization")
+    
+    def _process_load_data_from_redshift(self):
+        """Memory-optimized Redshift data processing"""
+        logger.info("Using memory-optimized Redshift data processing...")
+        
+        try:
+            # Check initial memory
+            self._log_memory_status("Before data query")
+            
+            if self.memory_optimization:
+                # Use chunked processing for large datasets
+                df = self.redshift_manager.query_sqmd_data_chunked()
+            else:
+                # Use regular processing
+                df = self.redshift_manager.query_sqmd_data()
+            
+            self._log_memory_status("After data query")
+            
+            if df.empty:
+                raise ValueError("No SQMD data retrieved from Redshift")
+            
+            logger.info(f"Successfully read {len(df):,} rows from Redshift")
+            
+            # Process data in memory-efficient way
+            df = self._memory_efficient_data_processing(df)
+            
+            self._log_memory_status("After data processing")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Memory-optimized Redshift processing failed: {str(e)}")
+            # Clean up memory on error
+            gc.collect()
+            raise
+    
+    def _memory_efficient_data_processing(self, df):
+        """Process data with memory optimization"""
+        logger.info("Starting memory-efficient data processing...")
+        
+        # Process in stages to minimize memory usage
+        
+        # Stage 1: Datetime processing
+        logger.info("Stage 1: Processing datetime columns...")
+        df = self._process_datetime_columns(df)
+        gc.collect()
+        
+        # Stage 2: Create classifications  
+        logger.info("Stage 2: Creating profile classifications...")
+        df = self._create_profile_classifications(df)
+        gc.collect()
+        
+        # Stage 3: Clean numeric data
+        logger.info("Stage 3: Cleaning numeric data...")
+        df = self._clean_numeric_data(df)
+        gc.collect()
+        
+        # Stage 4: Select and rename columns (reduce memory footprint)
+        logger.info("Stage 4: Selecting required columns...")
+        df = self._select_required_columns(df)
+        gc.collect()
+        
+        # Stage 5: Process submissions
+        logger.info("Stage 5: Processing submissions...")
+        df_final, df_initial = self._separate_submissions(df)
+        
+        # Clear original dataframe from memory
+        del df
+        gc.collect()
+        
+        # Stage 6: Aggregate data
+        logger.info("Stage 6: Aggregating hourly data...")
+        df_hour_final = self._aggregate_hourly_data(df_final, 'final')
+        df_hour_initial = self._aggregate_hourly_data(df_initial, 'initial')
+        
+        # Clear submission dataframes from memory
+        del df_final, df_initial
+        gc.collect()
+        
+        # Stage 7: Calculate metrics and merge
+        logger.info("Stage 7: Calculating metrics and merging...")
+        df_processed = self._calculate_metrics_and_merge(df_hour_final, df_hour_initial)
+        
+        # Clear hourly dataframes from memory
+        del df_hour_final, df_hour_initial
+        gc.collect()
+        
+        # Stage 8: Extend dataset and add features
+        logger.info("Stage 8: Extending dataset and adding features...")
+        df_extended = self._extend_dataset(df_processed)
+        del df_processed
+        gc.collect()
+        
+        df_final = self._add_date_features(df_extended)
+        del df_extended
+        gc.collect()
+        
+        logger.info(f"Memory-efficient processing completed: {len(df_final):,} records")
+        self._log_memory_status("After memory-efficient processing")
+        
+        return df_final
+    
+    def _create_profile_classifications(self, df):
+        """Create profile and NEM classifications"""
+        df['RateGroup'] = df['rategroup'].astype(str)
+        df['NEM'] = df['RateGroup'].apply(lambda x: 'NEM' if x.startswith(('NEM', 'SBP')) else 'Non_NEM')
+        df['Profile'] = df.apply(lambda row: row['loadprofile'] + '_' + row['NEM'] if row['loadprofile'] == 'RES' else row['loadprofile'], axis=1)
+        return df
+    
+    def _select_required_columns(self, df):
+        """Select only required columns to reduce memory usage"""
+        required_columns = ['TradeDateTime', 'tradedate', 'tradetime', 'Profile', 'lossadjustedload', 'metercount', 'submission']
+        df = df[required_columns].copy()
+        
+        # Rename columns
+        df.columns = ['TradeDateTime', 'TradeDate', 'TradeTime', 'Profile', 'LossAdjustedLoad', 'MeterCount', 'Submission']
+        return df
+    
+    def _calculate_metrics_and_merge(self, df_hour_final, df_hour_initial):
+        """Calculate load per meter and merge final/initial data"""
+        
+        # Calculate Load_Per_Meter for both datasets
+        df_hour_final['Load_Per_Meter'] = self._safe_division(df_hour_final['LoadHour'], df_hour_final['Count'])
+        df_hour_initial['Load_Per_Meter'] = self._safe_division(df_hour_initial['LoadHour'], df_hour_initial['Count'])
+        
+        # Rename initial columns
+        df_hour_initial = df_hour_initial.rename(columns={
+            'LoadHour': 'LoadHour_I',
+            'Count': 'Count_I', 
+            'Load_Per_Meter': 'Load_Per_Meter_I'
+        })
+        
+        # Merge final and initial data
+        df_merged = pd.merge(df_hour_final, df_hour_initial, on=['TradeDateTime', 'Profile'], how='right')
+        df_processed = df_merged[['TradeDateTime', 'Profile', 'Count', 'Load_Per_Meter', 'Count_I', 'Load_Per_Meter_I']].copy()
+        
+        return df_processed
+    
+    def _log_memory_status(self, stage):
+        """Log current memory usage"""
+        try:
+            memory_info = psutil.virtual_memory()
+            memory_percent = memory_info.percent
+            available_gb = memory_info.available / (1024**3)
+            used_gb = memory_info.used / (1024**3)
+            total_gb = memory_info.total / (1024**3)
+            
+            logger.info(f"Memory Status - {stage}:")
+            logger.info(f"  Used: {used_gb:.1f} GB / {total_gb:.1f} GB ({memory_percent:.1f}%)")
+            logger.info(f"  Available: {available_gb:.1f} GB")
+            
+            # Warn if memory usage is high
+            if memory_percent > 80:
+                logger.warning(f"High memory usage detected: {memory_percent:.1f}%")
+                
+        except Exception as e:
+            logger.warning(f"Could not get memory status: {str(e)}")
+    
+    def _train_test_split(self, final_dfs):
+        """Memory-optimized train-test split"""
+        split_date = pd.to_datetime(self.config.get_data_processing_config()['split_date'])
+        
+        for profile, df in final_dfs.items():
+            logger.info(f"Splitting data for {profile}")
+            self._log_memory_status(f"Before splitting {profile}")
+            
+            # Split data
+            train_set = df[df['Time'] < split_date].copy()
+            test_set = df[df['Time'] >= split_date].copy()
+            
+            # Clear original dataframe from memory immediately
+            del df
+            gc.collect()
+            
+            # Save and upload files
+            suffix = "_r" if profile == "df_RN" else ""
+            
+            # Save train set
+            train_local = os.path.join(
+                self.paths['output_path'], 'processed', 'train_test_split', 'train',
+                f"{profile}_train_{self.current_date}.csv"
+            )
+            train_s3_key = f"{self.config.config['s3']['processed_data_prefix']}train_test_split/train/{profile}_train_{self.current_date}.csv"
+            self.s3_manager.save_and_upload_dataframe(train_set, train_local, train_s3_key)
+            
+            # Clear train set from memory
+            del train_set
+            gc.collect()
+            
+            # Save test set to processed directory
+            test_local = os.path.join(
+                self.paths['output_path'], 'processed', 'train_test_split', 'test',
+                f"{profile}_test_{self.current_date}{suffix}.csv"
+            )
+            test_s3_key = f"{self.config.config['s3']['processed_data_prefix']}train_test_split/test/{profile}_test_{self.current_date}{suffix}.csv"
+            self.s3_manager.save_and_upload_dataframe(test_set, test_local, test_s3_key)
+            
+            # Save test set to input directory (for prediction)
+            input_local = os.path.join(
+                self.paths['output_path'], 'input',
+                f"{profile}_test_{self.current_date}{suffix}.csv"
+            )
+            input_s3_key = f"{self.config.config['s3']['input_data_prefix']}{profile}_test_{self.current_date}{suffix}.csv"
+            self.s3_manager.save_and_upload_dataframe(test_set, input_local, input_s3_key)
+            
+            logger.info(f"Split {profile}: {len(test_set)} test records")
+            
+            # Clear test set from memory
+            del test_set
+            gc.collect()
+            
+            self._log_memory_status(f"After processing {profile}")
+
+
 def main():
     """Main entry point for preprocessing container"""
     try:
-        pipeline = EnergyPreprocessingPipeline()
+        # Use memory-optimized pipeline if environment variable is set
+        if os.getenv('MEMORY_OPTIMIZATION') == '1':
+            logger.info("Using memory-optimized processing pipeline")
+            pipeline = MemoryOptimizedEnergyPreprocessingPipeline()
+        else:
+            logger.info("Using standard processing pipeline")
+            pipeline = EnergyPreprocessingPipeline()
+
         pipeline.run_preprocessing()
         logger.info("Preprocessing pipeline completed successfully!")
         sys.exit(0)

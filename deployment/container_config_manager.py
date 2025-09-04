@@ -1,0 +1,554 @@
+# =============================================================================
+# CONTAINER CONFIGURATION MANAGER - deployment/container_config_manager.py
+# =============================================================================
+"""
+Container Configuration Manager for Energy Forecasting MLOps
+Manages environment-aware container configuration generation
+"""
+
+import os
+import json
+import yaml
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional
+import boto3
+from datetime import datetime
+
+class ContainerConfigManager:
+    def __init__(self, environment: str = "dev", region: str = "us-west-2"):
+        self.environment = environment
+        self.region = region
+        self.account_id = boto3.client('sts').get_caller_identity()['Account']
+        self.logger = self._setup_logging()
+        
+        # Load environment configuration
+        self.config = self._load_environment_config()
+        
+    def _setup_logging(self) -> logging.Logger:
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        return logging.getLogger(f'ContainerConfigManager-{self.environment}')
+    
+    def _load_environment_config(self) -> Dict[str, Any]:
+        """Load environment-specific configuration"""
+        config_path = f"config/environments/{self.environment}.yml"
+        
+        if not os.path.exists(config_path):
+            self.logger.warning(f"Environment config not found: {config_path}, using defaults")
+            return self._get_default_config()
+        
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+            
+        # Replace template variables
+        config_str = yaml.dump(config)
+        config_str = config_str.replace("{{ AWS_ACCOUNT_ID }}", self.account_id)
+        return yaml.safe_load(config_str)
+    
+    def _get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration if environment config is missing"""
+        return {
+            'environment': self.environment,
+            'aws_account_id': self.account_id,
+            'aws_region': self.region,
+            's3': {
+                'data_bucket': f'sdcp-{self.environment}-sagemaker-energy-forecasting-data',
+                'model_bucket': f'sdcp-{self.environment}-sagemaker-energy-forecasting-models'
+            },
+            'containers': {
+                'preprocessing': {
+                    'environment': self.environment,
+                    'debug_mode': self.environment == 'dev',
+                    'log_level': 'DEBUG' if self.environment == 'dev' else 'INFO'
+                },
+                'training': {
+                    'environment': self.environment,
+                    'debug_mode': self.environment == 'dev',
+                    'log_level': 'DEBUG' if self.environment == 'dev' else 'INFO'
+                }
+            }
+        }
+    
+    def generate_container_configs(self) -> Dict[str, str]:
+        """Generate environment-aware container configuration files"""
+        self.logger.info(f"Generating container configs for environment: {self.environment}")
+        
+        configs_generated = {}
+        
+        # Generate preprocessing container config
+        preprocessing_config = self._generate_preprocessing_config()
+        preprocessing_path = "containers/preprocessing/src/config.py"
+        self._write_config_file(preprocessing_path, preprocessing_config)
+        configs_generated['preprocessing'] = preprocessing_path
+        
+        # Generate training container config
+        training_config = self._generate_training_config()
+        training_path = "containers/training/src/config.py"
+        self._write_config_file(training_path, training_config)
+        configs_generated['training'] = training_path
+        
+        # Generate buildspec.yml with environment variables
+        buildspec_config = self._generate_buildspec_config()
+        buildspec_path = "buildspec.yml"
+        self._write_buildspec_file(buildspec_path, buildspec_config)
+        configs_generated['buildspec'] = buildspec_path
+        
+        self.logger.info(f"Generated {len(configs_generated)} container configurations")
+        return configs_generated
+    
+    def _generate_preprocessing_config(self) -> str:
+        """Generate preprocessing container configuration"""
+        container_config = self.config['containers']['preprocessing']
+        s3_config = self.config['s3']
+        
+        config_content = f'''#!/usr/bin/env python3
+"""
+Energy Forecasting Preprocessing Configuration
+Auto-generated for environment: {self.environment}
+Generated at: {datetime.now().isoformat()}
+"""
+
+import os
+import logging
+
+# Environment Configuration
+ENVIRONMENT = "{self.environment}"
+AWS_REGION = "{self.region}"
+AWS_ACCOUNT_ID = "{self.account_id}"
+
+# Logging Configuration
+DEBUG_MODE = {container_config.get('debug_mode', False)}
+LOG_LEVEL = "{container_config.get('log_level', 'INFO')}"
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('energy-forecasting-preprocessing')
+
+# S3 Configuration
+DATA_BUCKET = "{s3_config['data_bucket']}"
+MODEL_BUCKET = "{s3_config['model_bucket']}"
+
+# Data Paths
+S3_PATHS = {{
+    "raw_data": "archived_folders/forecasting/data/raw/",
+    "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
+    "model_input": "archived_folders/forecasting/data/xgboost/input/",
+    "temp_data": "temp/preprocessing/"
+}}
+
+# Processing Configuration
+PROCESSING_CONFIG = {{
+    "chunk_size": 10000,
+    "parallel_processing": True,
+    "validation_enabled": True,
+    "debug_mode": DEBUG_MODE
+}}
+
+# Customer Profiles
+CUSTOMER_PROFILES = ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
+
+# Environment-specific settings
+if ENVIRONMENT == "dev":
+    PROCESSING_CONFIG["chunk_size"] = 5000
+    PROCESSING_CONFIG["validation_enabled"] = True
+elif ENVIRONMENT == "prod":
+    PROCESSING_CONFIG["chunk_size"] = 20000
+    PROCESSING_CONFIG["validation_enabled"] = False
+
+# Runtime environment variable override support
+def get_config_value(key: str, default_value):
+    """Get configuration value with environment variable override"""
+    env_var = f"ENERGY_FORECASTING_{{key.upper()}}"
+    return os.environ.get(env_var, default_value)
+
+# Apply environment overrides
+DATA_BUCKET = get_config_value("data_bucket", DATA_BUCKET)
+MODEL_BUCKET = get_config_value("model_bucket", MODEL_BUCKET)
+LOG_LEVEL = get_config_value("log_level", LOG_LEVEL)
+
+logger.info(f"Preprocessing configuration loaded for environment: {{ENVIRONMENT}}")
+logger.info(f"Data bucket: {{DATA_BUCKET}}")
+logger.info(f"Model bucket: {{MODEL_BUCKET}}")
+logger.debug(f"Processing config: {{PROCESSING_CONFIG}}")
+'''
+        return config_content
+    
+    def _generate_training_config(self) -> str:
+        """Generate training container configuration"""
+        container_config = self.config['containers']['training']
+        s3_config = self.config['s3']
+        
+        config_content = f'''#!/usr/bin/env python3
+"""
+Energy Forecasting Training Configuration
+Auto-generated for environment: {self.environment}
+Generated at: {datetime.now().isoformat()}
+"""
+
+import os
+import logging
+
+# Environment Configuration
+ENVIRONMENT = "{self.environment}"
+AWS_REGION = "{self.region}"
+AWS_ACCOUNT_ID = "{self.account_id}"
+
+# Logging Configuration
+DEBUG_MODE = {container_config.get('debug_mode', False)}
+LOG_LEVEL = "{container_config.get('log_level', 'INFO')}"
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('energy-forecasting-training')
+
+# S3 Configuration
+DATA_BUCKET = "{s3_config['data_bucket']}"
+MODEL_BUCKET = "{s3_config['model_bucket']}"
+
+# Model Training Configuration
+TRAINING_CONFIG = {{
+    "xgboost": {{
+        "n_estimators": 100,
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42
+    }},
+    "validation_split": 0.2,
+    "early_stopping_rounds": 10,
+    "eval_metric": "rmse"
+}}
+
+# Model Registry Configuration
+MODEL_REGISTRY_CONFIG = {{
+    "model_package_group_name": "energy-forecasting-models",
+    "approval_status": "Approved",
+    "performance_thresholds": {{
+        "RNN": {{"min_r2": 0.85, "max_mape": 5.0, "max_rmse": 0.1}},
+        "RN": {{"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12}},
+        "M": {{"min_r2": 0.85, "max_mape": 4.0, "max_rmse": 0.08}},
+        "S": {{"min_r2": 0.82, "max_mape": 5.5, "max_rmse": 0.10}},
+        "AGR": {{"min_r2": 0.80, "max_mape": 7.0, "max_rmse": 0.15}},
+        "L": {{"min_r2": 0.75, "max_mape": 8.0, "max_rmse": 0.20}},
+        "A6": {{"min_r2": 0.80, "max_mape": 6.0, "max_rmse": 0.12}}
+    }}
+}}
+
+# Data Paths
+S3_PATHS = {{
+    "processed_data": "archived_folders/forecasting/data/xgboost/processed/",
+    "model_input": "archived_folders/forecasting/data/xgboost/input/",
+    "model_output": "archived_folders/forecasting/models/",
+    "temp_models": "temp/training/"
+}}
+
+# Customer Profiles
+CUSTOMER_PROFILES = ["RNN", "RN", "M", "S", "AGR", "L", "A6"]
+
+# Environment-specific training parameters
+if ENVIRONMENT == "dev":
+    TRAINING_CONFIG["xgboost"]["n_estimators"] = 50  # Faster training for dev
+    TRAINING_CONFIG["early_stopping_rounds"] = 5
+elif ENVIRONMENT == "preprod":
+    TRAINING_CONFIG["xgboost"]["n_estimators"] = 100
+    TRAINING_CONFIG["early_stopping_rounds"] = 10
+elif ENVIRONMENT == "prod":
+    TRAINING_CONFIG["xgboost"]["n_estimators"] = 200  # More thorough training for prod
+    TRAINING_CONFIG["early_stopping_rounds"] = 20
+
+# Runtime environment variable override support
+def get_config_value(key: str, default_value):
+    """Get configuration value with environment variable override"""
+    env_var = f"ENERGY_FORECASTING_{{key.upper()}}"
+    return os.environ.get(env_var, default_value)
+
+# Apply environment overrides
+DATA_BUCKET = get_config_value("data_bucket", DATA_BUCKET)
+MODEL_BUCKET = get_config_value("model_bucket", MODEL_BUCKET)
+LOG_LEVEL = get_config_value("log_level", LOG_LEVEL)
+
+logger.info(f"Training configuration loaded for environment: {{ENVIRONMENT}}")
+logger.info(f"Data bucket: {{DATA_BUCKET}}")
+logger.info(f"Model bucket: {{MODEL_BUCKET}}")
+logger.debug(f"Training config: {{TRAINING_CONFIG}}")
+logger.debug(f"Model registry config: {{MODEL_REGISTRY_CONFIG}}")
+'''
+        return config_content
+    
+    def _generate_buildspec_config(self) -> str:
+        """Generate buildspec.yml with environment-aware configuration"""
+        buildspec_content = f'''version: 0.2
+
+env:
+  variables:
+    ENVIRONMENT: {self.environment}
+    AWS_DEFAULT_REGION: {self.region}
+    AWS_ACCOUNT_ID: {self.account_id}
+    IMAGE_TAG: latest
+    ECR_PREFIX: energy
+  
+phases:
+  pre_build:
+    commands:
+      - echo "=== PRE-BUILD PHASE ==="
+      - echo "Environment: $ENVIRONMENT"
+      - echo "Account ID: $AWS_ACCOUNT_ID"
+      - echo "Region: $AWS_DEFAULT_REGION"
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      
+      # Create ECR repositories if they don't exist
+      - |
+        for repo in energy-preprocessing energy-training energy-prediction; do
+          echo "Creating ECR repository: $repo"
+          aws ecr create-repository --repository-name $repo --region $AWS_DEFAULT_REGION || echo "Repository $repo already exists"
+        done
+  
+  build:
+    commands:
+      - echo "=== BUILD PHASE ==="
+      
+      # Build preprocessing container
+      - echo "Building preprocessing container..."
+      - cd containers/preprocessing
+      - docker build -t $ECR_PREFIX-preprocessing:$IMAGE_TAG .
+      - docker tag $ECR_PREFIX-preprocessing:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-preprocessing:$IMAGE_TAG
+      - docker tag $ECR_PREFIX-preprocessing:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-preprocessing:$ENVIRONMENT-$IMAGE_TAG
+      - cd ../..
+      
+      # Build training container
+      - echo "Building training container..."
+      - cd containers/training
+      - docker build -t $ECR_PREFIX-training:$IMAGE_TAG .
+      - docker tag $ECR_PREFIX-training:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-training:$IMAGE_TAG
+      - docker tag $ECR_PREFIX-training:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-training:$ENVIRONMENT-$IMAGE_TAG
+      - cd ../..
+      
+      # Build prediction container (if exists)
+      - |
+        if [ -d "containers/prediction" ]; then
+          echo "Building prediction container..."
+          cd containers/prediction
+          docker build -t $ECR_PREFIX-prediction:$IMAGE_TAG .
+          docker tag $ECR_PREFIX-prediction:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$IMAGE_TAG
+          docker tag $ECR_PREFIX-prediction:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$ENVIRONMENT-$IMAGE_TAG
+          cd ../..
+        fi
+  
+  post_build:
+    commands:
+      - echo "=== POST-BUILD PHASE ==="
+      
+      # Push preprocessing container
+      - echo "Pushing preprocessing container..."
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-preprocessing:$IMAGE_TAG
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-preprocessing:$ENVIRONMENT-$IMAGE_TAG
+      
+      # Push training container
+      - echo "Pushing training container..."
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-training:$IMAGE_TAG
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-training:$ENVIRONMENT-$IMAGE_TAG
+      
+      # Push prediction container (if exists)
+      - |
+        if [ -d "containers/prediction" ]; then
+          echo "Pushing prediction container..."
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$IMAGE_TAG
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$ENVIRONMENT-$IMAGE_TAG
+        fi
+      
+      # Create build summary
+      - |
+        cat > container-build-summary.json << EOF
+        {{
+          "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "environment": "$ENVIRONMENT",
+          "account_id": "$AWS_ACCOUNT_ID",
+          "region": "$AWS_DEFAULT_REGION",
+          "image_tag": "$IMAGE_TAG",
+          "containers_built": [
+            {{
+              "name": "energy-preprocessing",
+              "repository": "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/energy-preprocessing",
+              "tags": ["$IMAGE_TAG", "$ENVIRONMENT-$IMAGE_TAG"]
+            }},
+            {{
+              "name": "energy-training", 
+              "repository": "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/energy-training",
+              "tags": ["$IMAGE_TAG", "$ENVIRONMENT-$IMAGE_TAG"]
+            }}
+          ]
+        }}
+        EOF
+      
+      - echo "=== BUILD COMPLETE ==="
+      - echo "Container build summary created: container-build-summary.json"
+
+artifacts:
+  files:
+    - container-build-summary.json
+'''
+        return buildspec_content
+    
+    def _write_config_file(self, file_path: str, content: str) -> None:
+        """Write configuration file with proper formatting"""
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Write configuration file
+        with open(file_path, 'w') as f:
+            f.write(content)
+        
+        self.logger.info(f"Generated configuration file: {file_path}")
+    
+    def _write_buildspec_file(self, file_path: str, content: str) -> None:
+        """Write buildspec.yml file"""
+        with open(file_path, 'w') as f:
+            f.write(content)
+        
+        self.logger.info(f"Generated buildspec file: {file_path}")
+    
+    def backup_existing_configs(self) -> Dict[str, str]:
+        """Backup existing configuration files"""
+        backup_dir = f"backup/container-configs/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        backed_up = {}
+        
+        config_files = [
+            "containers/preprocessing/src/config.py",
+            "containers/training/src/config.py",
+            "buildspec.yml"
+        ]
+        
+        for config_file in config_files:
+            if os.path.exists(config_file):
+                backup_path = os.path.join(backup_dir, os.path.basename(config_file))
+                os.system(f"cp {config_file} {backup_path}")
+                backed_up[config_file] = backup_path
+                self.logger.info(f"Backed up {config_file} to {backup_path}")
+        
+        return backed_up
+    
+    def validate_container_configs(self) -> Dict[str, Any]:
+        """Validate generated container configurations"""
+        validation_results = {
+            "preprocessing_config": False,
+            "training_config": False,
+            "buildspec_config": False,
+            "errors": []
+        }
+        
+        # Validate preprocessing config
+        try:
+            preprocessing_path = "containers/preprocessing/src/config.py"
+            if os.path.exists(preprocessing_path):
+                # Simple syntax check
+                with open(preprocessing_path, 'r') as f:
+                    compile(f.read(), preprocessing_path, 'exec')
+                validation_results["preprocessing_config"] = True
+                self.logger.info("Preprocessing config validation: PASSED")
+            else:
+                validation_results["errors"].append("Preprocessing config file not found")
+        except Exception as e:
+            validation_results["errors"].append(f"Preprocessing config validation error: {str(e)}")
+        
+        # Validate training config
+        try:
+            training_path = "containers/training/src/config.py"
+            if os.path.exists(training_path):
+                # Simple syntax check
+                with open(training_path, 'r') as f:
+                    compile(f.read(), training_path, 'exec')
+                validation_results["training_config"] = True
+                self.logger.info("Training config validation: PASSED")
+            else:
+                validation_results["errors"].append("Training config file not found")
+        except Exception as e:
+            validation_results["errors"].append(f"Training config validation error: {str(e)}")
+        
+        # Validate buildspec
+        try:
+            buildspec_path = "buildspec.yml"
+            if os.path.exists(buildspec_path):
+                with open(buildspec_path, 'r') as f:
+                    yaml.safe_load(f)
+                validation_results["buildspec_config"] = True
+                self.logger.info("Buildspec validation: PASSED")
+            else:
+                validation_results["errors"].append("Buildspec file not found")
+        except Exception as e:
+            validation_results["errors"].append(f"Buildspec validation error: {str(e)}")
+        
+        return validation_results
+
+def main():
+    """Main function for container configuration management"""
+    parser = argparse.ArgumentParser(description='Container Configuration Manager')
+    parser.add_argument('--environment', default='dev', 
+                       choices=['dev', 'preprod', 'prod'],
+                       help='Target environment')
+    parser.add_argument('--region', default='us-west-2', help='AWS region')
+    parser.add_argument('--generate-configs', action='store_true',
+                       help='Generate container configuration files')
+    parser.add_argument('--backup-existing', action='store_true',
+                       help='Backup existing configuration files')
+    parser.add_argument('--validate', action='store_true',
+                       help='Validate generated configurations')
+    
+    args = parser.parse_args()
+    
+    # Initialize manager
+    manager = ContainerConfigManager(
+        environment=args.environment,
+        region=args.region
+    )
+    
+    try:
+        # Backup existing configs if requested
+        if args.backup_existing:
+            backed_up = manager.backup_existing_configs()
+            print(f"Backed up {len(backed_up)} configuration files")
+        
+        # Generate configs if requested
+        if args.generate_configs:
+            configs_generated = manager.generate_container_configs()
+            print(f"Generated {len(configs_generated)} configuration files:")
+            for name, path in configs_generated.items():
+                print(f"  {name}: {path}")
+        
+        # Validate configs if requested
+        if args.validate:
+            validation_results = manager.validate_container_configs()
+            print("Configuration validation results:")
+            for config_name, result in validation_results.items():
+                if config_name != "errors":
+                    status = "PASSED" if result else "FAILED"
+                    print(f"  {config_name}: {status}")
+            
+            if validation_results["errors"]:
+                print("Validation errors:")
+                for error in validation_results["errors"]:
+                    print(f"  - {error}")
+                return 1
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return 1
+
+if __name__ == "__main__":
+    exit(main())
