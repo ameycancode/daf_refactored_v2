@@ -4,6 +4,7 @@
 """
 Container Configuration Manager for Energy Forecasting MLOps
 Manages environment-aware container configuration generation
+Updated for sdcp_code/ folder structure
 """
 
 import os
@@ -36,7 +37,7 @@ class ContainerConfigManager:
     
     def _load_environment_config(self) -> Dict[str, Any]:
         """Load environment-specific configuration"""
-        config_path = f"config/environments/{self.environment}.yml"
+        config_path = f"sdcp_code/config/environments/{self.environment}.yml"
         
         if not os.path.exists(config_path):
             self.logger.warning(f"Environment config not found: {config_path}, using defaults")
@@ -60,6 +61,16 @@ class ContainerConfigManager:
                 'data_bucket': f'sdcp-{self.environment}-sagemaker-energy-forecasting-data',
                 'model_bucket': f'sdcp-{self.environment}-sagemaker-energy-forecasting-models'
             },
+            'redshift': {
+                'bi_schema': f'edp_bi_{"" if self.environment == "prod" else self.environment}',
+                'cluster_identifier': f'sdcp-edp-backend-{"prod" if self.environment == "prod" else self.environment}',
+                'database': 'sdcp',
+                'db_user': 'ds_service_user',
+                'input_schema': f'edp_cust_{"" if self.environment == "prod" else self.environment}',
+                'input_table': 'caiso_sqmd',
+                'operational_schema': f'edp_forecasting_{"" if self.environment == "prod" else self.environment}',
+                'operational_table': 'dayahead_load_forecasts'
+            },
             'containers': {
                 'preprocessing': {
                     'environment': self.environment,
@@ -82,17 +93,17 @@ class ContainerConfigManager:
         
         # Generate preprocessing container config
         preprocessing_config = self._generate_preprocessing_json()
-        preprocessing_path = "containers/preprocessing/src/config.json"
-        self._write_config_file(preprocessing_path, preprocessing_config)
+        preprocessing_path = "sdcp_code/containers/preprocessing/src/config.json"
+        self._write_json_file(preprocessing_path, preprocessing_config)
         configs_generated['preprocessing'] = preprocessing_path
         
         # Generate training container config
         training_config = self._generate_training_json()
-        training_path = "containers/training/src/config.json"
-        self._write_config_file(training_path, training_config)
+        training_path = "sdcp_code/containers/training/src/config.json"
+        self._write_json_file(training_path, training_config)
         configs_generated['training'] = training_path
         
-        # Generate buildspec.yml with environment variables
+        # Generate buildspec.yml with environment variables (keep at root)
         buildspec_config = self._generate_buildspec_config()
         buildspec_path = "buildspec.yml"
         self._write_buildspec_file(buildspec_path, buildspec_config)
@@ -232,7 +243,7 @@ class ContainerConfigManager:
         self.logger.info(f"Generated JSON configuration file: {file_path}")
         
     def _generate_buildspec_config(self) -> str:
-        """Generate buildspec.yml with environment-aware configuration"""
+        """Generate buildspec.yml with environment-aware configuration for sdcp_code structure"""
         buildspec_content = f'''version: 0.2
 
 env:
@@ -250,6 +261,11 @@ phases:
       - echo "Environment: $ENVIRONMENT"
       - echo "Account ID: $AWS_ACCOUNT_ID"
       - echo "Region: $AWS_DEFAULT_REGION"
+      - echo "Working Directory: $(pwd)"
+      - echo "Directory Contents:"
+      - ls -la
+      - echo "SDCP Code Directory Contents:"
+      - ls -la sdcp_code/ || echo "sdcp_code directory not found"
       - echo "Logging in to Amazon ECR..."
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       
@@ -263,32 +279,51 @@ phases:
   build:
     commands:
       - echo "=== BUILD PHASE ==="
+      - echo "Current working directory: $(pwd)"
+      - echo "Available directories:"
+      - ls -la
+      
+      # Generate container configurations
+      - echo "Generating container configurations..."
+      - python sdcp_code/deployment/container_config_manager.py --environment $ENVIRONMENT --generate-configs || echo "Config generation failed, continuing with existing configs"
       
       # Build preprocessing container
       - echo "Building preprocessing container..."
-      - cd containers/preprocessing
+      - echo "Checking for preprocessing container directory..."
+      - ls -la sdcp_code/containers/preprocessing/ || echo "Preprocessing container directory not found"
+      - cd sdcp_code/containers/preprocessing
+      - echo "Contents of preprocessing directory:"
+      - ls -la
       - docker build -t $ECR_PREFIX-preprocessing:$IMAGE_TAG .
       - docker tag $ECR_PREFIX-preprocessing:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-preprocessing:$IMAGE_TAG
       - docker tag $ECR_PREFIX-preprocessing:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-preprocessing:$ENVIRONMENT-$IMAGE_TAG
-      - cd ../..
+      - cd ../../..
       
       # Build training container
       - echo "Building training container..."
-      - cd containers/training
+      - echo "Checking for training container directory..."
+      - ls -la sdcp_code/containers/training/ || echo "Training container directory not found"
+      - cd sdcp_code/containers/training
+      - echo "Contents of training directory:"
+      - ls -la
       - docker build -t $ECR_PREFIX-training:$IMAGE_TAG .
       - docker tag $ECR_PREFIX-training:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-training:$IMAGE_TAG
       - docker tag $ECR_PREFIX-training:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-training:$ENVIRONMENT-$IMAGE_TAG
-      - cd ../..
+      - cd ../../..
       
       # Build prediction container (if exists)
       - |
-        if [ -d "containers/prediction" ]; then
+        if [ -d "sdcp_code/containers/prediction" ]; then
           echo "Building prediction container..."
-          cd containers/prediction
+          cd sdcp_code/containers/prediction
+          echo "Contents of prediction directory:"
+          ls -la
           docker build -t $ECR_PREFIX-prediction:$IMAGE_TAG .
           docker tag $ECR_PREFIX-prediction:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$IMAGE_TAG
           docker tag $ECR_PREFIX-prediction:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$ENVIRONMENT-$IMAGE_TAG
-          cd ../..
+          cd ../../..
+        else
+          echo "Prediction container directory not found, skipping..."
         fi
   
   post_build:
@@ -307,10 +342,12 @@ phases:
       
       # Push prediction container (if exists)
       - |
-        if [ -d "containers/prediction" ]; then
+        if docker images | grep -q $ECR_PREFIX-prediction; then
           echo "Pushing prediction container..."
           docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$IMAGE_TAG
           docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_PREFIX-prediction:$ENVIRONMENT-$IMAGE_TAG
+        else
+          echo "Prediction container not built, skipping push..."
         fi
       
       # Create build summary
@@ -322,16 +359,19 @@ phases:
           "account_id": "$AWS_ACCOUNT_ID",
           "region": "$AWS_DEFAULT_REGION",
           "image_tag": "$IMAGE_TAG",
+          "folder_structure": "sdcp_code",
           "containers_built": [
             {{
               "name": "energy-preprocessing",
               "repository": "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/energy-preprocessing",
-              "tags": ["$IMAGE_TAG", "$ENVIRONMENT-$IMAGE_TAG"]
+              "tags": ["$IMAGE_TAG", "$ENVIRONMENT-$IMAGE_TAG"],
+              "path": "sdcp_code/containers/preprocessing"
             }},
             {{
               "name": "energy-training", 
               "repository": "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/energy-training",
-              "tags": ["$IMAGE_TAG", "$ENVIRONMENT-$IMAGE_TAG"]
+              "tags": ["$IMAGE_TAG", "$ENVIRONMENT-$IMAGE_TAG"],
+              "path": "sdcp_code/containers/training"
             }}
           ]
         }}
@@ -339,23 +379,14 @@ phases:
       
       - echo "=== BUILD COMPLETE ==="
       - echo "Container build summary created: container-build-summary.json"
+      - echo "Final directory listing:"
+      - ls -la
 
 artifacts:
   files:
     - container-build-summary.json
 '''
         return buildspec_content
-    
-    def _write_config_file(self, file_path: str, content: str) -> None:
-        """Write configuration file with proper formatting"""
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        
-        # Write configuration file
-        with open(file_path, 'w') as f:
-            f.write(content)
-        
-        self.logger.info(f"Generated configuration file: {file_path}")
     
     def _write_buildspec_file(self, file_path: str, content: str) -> None:
         """Write buildspec.yml file"""
@@ -371,9 +402,10 @@ artifacts:
         
         backed_up = {}
         
+        # Updated paths for sdcp_code structure
         config_files = [
-            "containers/preprocessing/src/config.py",
-            "containers/training/src/config.py",
+            "sdcp_code/containers/preprocessing/src/config.json",
+            "sdcp_code/containers/training/src/config.json", 
             "buildspec.yml"
         ]
         
@@ -395,31 +427,31 @@ artifacts:
             "errors": []
         }
         
-        # Validate preprocessing config
+        # Validate preprocessing config (JSON now, not Python)
         try:
-            preprocessing_path = "containers/preprocessing/src/config.py"
+            preprocessing_path = "sdcp_code/containers/preprocessing/src/config.json"
             if os.path.exists(preprocessing_path):
-                # Simple syntax check
+                # JSON syntax check
                 with open(preprocessing_path, 'r') as f:
-                    compile(f.read(), preprocessing_path, 'exec')
+                    json.load(f)
                 validation_results["preprocessing_config"] = True
-                self.logger.info("Preprocessing config validation: PASSED")
+                self.logger.info("Preprocessing JSON config validation: PASSED")
             else:
-                validation_results["errors"].append("Preprocessing config file not found")
+                validation_results["errors"].append("Preprocessing config JSON file not found")
         except Exception as e:
             validation_results["errors"].append(f"Preprocessing config validation error: {str(e)}")
         
-        # Validate training config
+        # Validate training config (JSON now, not Python)
         try:
-            training_path = "containers/training/src/config.py"
+            training_path = "sdcp_code/containers/training/src/config.json"
             if os.path.exists(training_path):
-                # Simple syntax check
+                # JSON syntax check
                 with open(training_path, 'r') as f:
-                    compile(f.read(), training_path, 'exec')
+                    json.load(f)
                 validation_results["training_config"] = True
-                self.logger.info("Training config validation: PASSED")
+                self.logger.info("Training JSON config validation: PASSED")
             else:
-                validation_results["errors"].append("Training config file not found")
+                validation_results["errors"].append("Training config JSON file not found")
         except Exception as e:
             validation_results["errors"].append(f"Training config validation error: {str(e)}")
         
@@ -440,7 +472,7 @@ artifacts:
 
 def main():
     """Main function for container configuration management"""
-    parser = argparse.ArgumentParser(description='Container Configuration Manager')
+    parser = argparse.ArgumentParser(description='Container Configuration Manager for SDCP Code Structure')
     parser.add_argument('--environment', default='dev', 
                        choices=['dev', 'preprod', 'prod'],
                        help='Target environment')
@@ -461,6 +493,9 @@ def main():
     )
     
     try:
+        print(f"Container Configuration Manager for Environment: {args.environment}")
+        print(f"Working with sdcp_code/ folder structure")
+        
         # Backup existing configs if requested
         if args.backup_existing:
             backed_up = manager.backup_existing_configs()
@@ -488,6 +523,7 @@ def main():
                     print(f"  - {error}")
                 return 1
         
+        print("Container configuration management completed successfully!")
         return 0
         
     except Exception as e:

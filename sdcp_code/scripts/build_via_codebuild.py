@@ -12,11 +12,12 @@ import os
 from datetime import datetime
 
 class CodeBuildManager:
-    def __init__(self, region="us-west-2"):
+    def __init__(self, region="us-west-2", environment="dev"):
         self.region = region
+        self.environment = environment
         self.codebuild_client = boto3.client('codebuild', region_name=region)
         self.account_id = boto3.client('sts').get_caller_identity()['Account']
-        self.role_name = 'sdcp-dev-sagemaker-energy-forecasting-datascientist-role'      
+        self.role_name = f'sdcp-{self.environment}-sagemaker-energy-forecasting-datascientist-role'      
         self.project_name = "energy-forecasting-container-builds"
        
     def create_codebuild_project(self):
@@ -39,7 +40,7 @@ class CodeBuildManager:
                     'description': 'Build and push Energy Forecasting container images',
                     'source': {
                         'type': 'S3',
-                        'location': 'sdcp-dev-sagemaker-energy-forecasting-data/codebuild-source/source.zip',
+                        'location': f'sdcp-{self.environment}-sagemaker-energy-forecasting-data/codebuild-source/source.zip',
                         'buildspec': 'buildspec.yml'
                     },
                     'artifacts': {
@@ -111,7 +112,7 @@ class CodeBuildManager:
        
         # Upload to S3
         s3_client = boto3.client('s3', region_name=self.region)
-        bucket_name = 'sdcp-dev-sagemaker-energy-forecasting-data'
+        bucket_name = f'sdcp-{self.environment}-sagemaker-energy-forecasting-data'
         s3_key = 'codebuild-source/source.zip'
        
         try:
@@ -251,11 +252,14 @@ def main():
    
     parser = argparse.ArgumentParser(description='Build containers via CodeBuild')
     parser.add_argument('--region', default='us-west-2', help='AWS region')
+    parser.add_argument('--environment', default='dev', 
+                       choices=['dev', 'preprod', 'prod'],
+                       help='Target environment')
     parser.add_argument('--create-only', action='store_true', help='Only create CodeBuild project')
    
     args = parser.parse_args()
    
-    manager = CodeBuildManager(region=args.region)
+    manager = CodeBuildManager(region=args.region, environment=args.environment)
    
     if args.create_only:
         print("Creating CodeBuild project only...")

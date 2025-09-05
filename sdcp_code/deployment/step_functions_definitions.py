@@ -449,7 +449,7 @@ def get_training_pipeline_definition(roles, account_id, region, data_bucket, mod
                         "model_registry_status": "SUCCESS",
                         "parallel_endpoint_status": "SUCCESS",
                         "total_profiles_processed": 7,
-                        "s3_configurations_location": "s3://sdcp-dev-sagemaker-energy-forecasting-data/endpoint-configurations/"
+                        "s3_configurations_location": f"{data_bucket}/endpoint-configurations/"
                     },
                     "next_steps": [
                         "Models registered in SageMaker Model Registry",
@@ -713,8 +713,8 @@ def get_enhanced_prediction_pipeline_definition(roles, account_id, region, data_
                                     "operation": "run_profile_prediction",
                                     "profile.$": "$.profile",
                                     "endpoint_name.$": "$.endpoint_name",
-                                    "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
-                                    "model_bucket": "sdcp-dev-sagemaker-energy-forecasting-models",
+                                    "data_bucket": data_bucket,
+                                    "model_bucket": model_bucket,
                                     "execution_id.$": "$$.Execution.Name"
                                 }
                             },
@@ -1098,35 +1098,35 @@ if __name__ == "__main__":
     print("✓ Profile-specific data processing")
     print("✓ Real-time execution monitoring")
     print()
-    # Check status of all rules
-    print("=== EventBridge Schedule Status ===")
-    status = manage_eventbridge_schedules('us-west-2', 'status')
-    for rule, info in status.items():
-        if isinstance(info, dict):
-            print(f"{rule}:")
-            print(f"  State: {info['current_state']}")
-            print(f"  Schedule: {info['schedule']}")
-            print(f"  Description: {info['description']}")
-        else:
-            print(f"{rule}: {info}")
+    # # Check status of all rules
+    # print("=== EventBridge Schedule Status ===")
+    # status = manage_eventbridge_schedules('us-west-2', 'status')
+    # for rule, info in status.items():
+    #     if isinstance(info, dict):
+    #         print(f"{rule}:")
+    #         print(f"  State: {info['current_state']}")
+    #         print(f"  Schedule: {info['schedule']}")
+    #         print(f"  Description: {info['description']}")
+    #     else:
+    #         print(f"{rule}: {info}")
    
-    print("\n=== Schedule Details ===")
-    print("Daily Predictions:")
-    print("  - Schedule: cron(0 6 * * ? *)  # Daily at 6 AM UTC")
-    print("  - Profiles: All 7 profiles (RNN, RN, M, S, AGR, L, A6)")
-    print("  - State: DISABLED by default")
+    # print("\n=== Schedule Details ===")
+    # print("Daily Predictions:")
+    # print("  - Schedule: cron(0 6 * * ? *)  # Daily at 6 AM UTC")
+    # print("  - Profiles: All 7 profiles (RNN, RN, M, S, AGR, L, A6)")
+    # print("  - State: DISABLED by default")
    
-    print("\nMonthly Training:")
-    print("  - Schedule: cron(0 4 L * ? *)  # Last day of month at 4 AM UTC")
-    print("  - Purpose: Complete model retraining for all profiles")
-    print("  - State: DISABLED by default")
+    # print("\nMonthly Training:")
+    # print("  - Schedule: cron(0 4 L * ? *)  # Last day of month at 4 AM UTC")
+    # print("  - Purpose: Complete model retraining for all profiles")
+    # print("  - State: DISABLED by default")
    
-    print("\n=== Management Commands ===")
-    print("Enable schedules:")
-    print("  python -c \"from infrastructure.step_functions_definitions import manage_eventbridge_schedules; print(manage_eventbridge_schedules('us-west-2', 'enable'))\"")
+    # print("\n=== Management Commands ===")
+    # print("Enable schedules:")
+    # print("  python -c \"from infrastructure.step_functions_definitions import manage_eventbridge_schedules; print(manage_eventbridge_schedules('us-west-2', 'enable'))\"")
    
-    print("\nDisable schedules:")
-    print("  python -c \"from infrastructure.step_functions_definitions import manage_eventbridge_schedules; print(manage_eventbridge_schedules('us-west-2', 'disable'))\"")
+    # print("\nDisable schedules:")
+    # print("  python -c \"from infrastructure.step_functions_definitions import manage_eventbridge_schedules; print(manage_eventbridge_schedules('us-west-2', 'disable'))\"")
 
     print()
     print("Usage Examples:")

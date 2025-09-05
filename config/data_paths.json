@@ -1,8 +1,0 @@
-{
-  "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
-  "model_bucket": "sdcp-dev-sagemaker-energy-forecasting-models",
-  "raw_data_path": "archived_folders/forecasting/data/raw/",
-  "processed_data_path": "archived_folders/forecasting/data/xgboost/processed/",
-  "model_input_path": "archived_folders/forecasting/data/xgboost/input/",
-  "predictions_output_path": "archived_folders/forecasting/data/xgboost/output/"
-}

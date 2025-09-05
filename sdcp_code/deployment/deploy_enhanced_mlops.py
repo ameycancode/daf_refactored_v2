@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Complete Enhanced MLOps Deployment Script
-deployment/deploy_enhanced_mlops.py
+sdcp_code/deployment/deploy_enhanced_mlops.py
 
 Deploys the complete enhanced prediction pipeline including:
 - Enhanced Lambda functions
@@ -21,8 +21,12 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 import time
 
-# Add project paths
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add project paths for sdcp_code structure
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sdcp_code_dir = os.path.dirname(current_dir)  # sdcp_code directory
+project_root = os.path.dirname(sdcp_code_dir)  # repository root
+sys.path.append(sdcp_code_dir)
+sys.path.append(project_root)
 
 # Setup logging
 logging.basicConfig(
@@ -51,7 +55,7 @@ class EnhancedMLOpsDeployer:
         self.s3_client = boto3.client('s3', region_name=region)
         self.iam_client = boto3.client('iam')
         
-        # Configuration
+        # Environment-aware configuration
         self.config = {
             'region': region,
             'account_id': self.account_id,
@@ -59,10 +63,10 @@ class EnhancedMLOpsDeployer:
             'model_bucket': f'sdcp-{environment}-sagemaker-energy-forecasting-models',
             'datascientist_role': f'arn:aws:iam::{self.account_id}:role/sdcp-{environment}-sagemaker-energy-forecasting-datascientist-role',
             'eventbridge_role': f'arn:aws:iam::{self.account_id}:role/EnergyForecastingEventBridgeRole',
-            'training_state_machine': 'energy-forecasting-training-pipeline',
-            'enhanced_prediction_state_machine': 'energy-forecasting-enhanced-prediction-pipeline',
-            'legacy_prediction_state_machine': 'energy-forecasting-daily-predictions',
-            'containers': ['energy-preprocessing', 'energy-training'] # , 'energy-prediction']
+            'training_state_machine': f'energy-forecasting-{environment}-training-pipeline',
+            'enhanced_prediction_state_machine': f'energy-forecasting-{environment}-enhanced-prediction-pipeline',
+            'legacy_prediction_state_machine': f'energy-forecasting-{environment}-daily-predictions',
+            'containers': [f'energy-preprocessing', f'energy-training']  # environment-agnostic names
         }
         
         # Deployment components
@@ -77,6 +81,7 @@ class EnhancedMLOpsDeployer:
         ]
         
         logger.info(f"Enhanced MLOps Deployer initialized for {environment} environment")
+        logger.info(f"Using sdcp_code structure from: {sdcp_code_dir}")
 
     def deploy_complete_enhanced_pipeline(self) -> Dict[str, Any]:
         """Deploy the complete enhanced prediction pipeline"""
@@ -112,9 +117,6 @@ class EnhancedMLOpsDeployer:
             lambda_result = self._deploy_enhanced_lambdas()
             deployment_results['enhanced_lambdas'] = lambda_result
             
-            # if lambda_result.get('deployment_success_rate', 0) < 75:
-            #     raise Exception("Enhanced Lambda deployment failed - cannot proceed")
-            
             # Step 3: Deploy Enhanced Step Functions
             logger.info("\n" + "="*60)
             logger.info("STEP 3: DEPLOYING ENHANCED STEP FUNCTIONS")
@@ -128,7 +130,6 @@ class EnhancedMLOpsDeployer:
             logger.info("STEP 4: BUILDING AND PUSHING CONTAINERS")
             logger.info("="*60)
             
-            # containers_result = self._deploy_enhanced_containers()
             containers_result = self._build_and_push_containers()
             deployment_results['enhanced_containers'] = containers_result
             
@@ -161,17 +162,16 @@ class EnhancedMLOpsDeployer:
             summary = self._generate_deployment_summary(deployment_results, deployment_time)
 
             logger.info(f"DEPLOYMENT RESULTS: {deployment_results}")
-
             logger.info(f"DEPLOYMENT SUMMARY: {summary['deployment_summary']}")
+            
             deployment_summary = summary['deployment_summary']
-
             overall_success = deployment_summary['overall_success']
             
             logger.info("\n" + "="*100)
             logger.info("ENHANCED MLOPS DEPLOYMENT COMPLETED")
             logger.info("="*100)
             logger.info(f"Total deployment time: {deployment_time / 60:.2f} minutes")
-            logger.info(f"Overall success: {summary.get('overall_success', False)}")
+            logger.info(f"Overall success: {overall_success}")
             
             return summary
             
@@ -191,6 +191,7 @@ class EnhancedMLOpsDeployer:
         """Validate the deployment environment"""
         
         try:
+            # Updated import path for sdcp_code structure
             from validate_environment import EnvironmentValidator
             
             validator = EnvironmentValidator(region=self.region, environment=self.environment)
@@ -198,7 +199,6 @@ class EnhancedMLOpsDeployer:
 
             logger.info(f"VALIDATION SUMMARY: {validation_result['validation_summary']}")
             validation_summary = validation_result['validation_summary']
-
             overall_status = validation_summary['overall_status']
             
             logger.info(f"Environment validation: {overall_status}")
@@ -228,7 +228,8 @@ class EnhancedMLOpsDeployer:
             
             # Check IAM roles
             try:
-                self.iam_client.get_role(RoleName=self.config['datascientist_role'].split('/')[-1])
+                role_name = self.config['datascientist_role'].split('/')[-1]
+                self.iam_client.get_role(RoleName=role_name)
                 validation_results['iam_roles_exist'] = True
                 logger.info("✓ IAM roles validated")
             except Exception as e:
@@ -280,12 +281,14 @@ class EnhancedMLOpsDeployer:
         """Deploy enhanced Lambda functions"""
         
         try:
+            # Updated import path for sdcp_code structure
             from lambda_deployer import CompleteLambdaDeployer
             
-            deployer = CompleteLambdaDeployer(region=self.region)
+            deployer = CompleteLambdaDeployer(
+                region=self.region, 
+                environment=self.environment
+            )
             result = deployer.deploy_all_lambda_functions()
-            
-            # logger.info(f"Enhanced Lambda deployment: {result.get('deployment_success_rate', 0):.1f}% success rate")
             
             return result
             
@@ -306,8 +309,11 @@ class EnhancedMLOpsDeployer:
         """Deploy enhanced Step Functions"""
         
         try:
-            # Import the enhanced step functions definition
-            sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'infrastructure'))
+            # Updated import path for sdcp_code structure
+            infrastructure_path = os.path.join(sdcp_code_dir, 'infrastructure')
+            if infrastructure_path not in sys.path:
+                sys.path.append(infrastructure_path)
+            
             from step_functions_definitions import get_enhanced_step_functions_with_integration
             
             roles = {"datascientist_role": self.config['datascientist_role']}
@@ -317,7 +323,8 @@ class EnhancedMLOpsDeployer:
                 account_id=self.account_id,
                 region=self.region,
                 data_bucket=self.config['data_bucket'],
-                model_bucket=self.config['model_bucket']
+                model_bucket=self.config['model_bucket'],
+                # environment=self.environment  # Pass environment for naming
             )
             
             logger.info("✓ Enhanced Step Functions deployed successfully")
@@ -336,8 +343,6 @@ class EnhancedMLOpsDeployer:
                 'error': str(e)
             }
 
-    # def _deploy_enhanced_containers(self) -> Dict[str, Any]:
-
     def _build_and_push_containers(self) -> bool:
         """Build and push all container images"""
         
@@ -352,11 +357,15 @@ class EnhancedMLOpsDeployer:
             
             # Build containers using CodeBuild or local Docker
             try:
-                # Try CodeBuild first
+                # Try CodeBuild first - Updated path for sdcp_code structure
+                scripts_dir = os.path.join(sdcp_code_dir, 'scripts')
+                codebuild_script = os.path.join(scripts_dir, 'build_via_codebuild.py')
+                
                 result = subprocess.run([
-                    'python', 'scripts/build_via_codebuild.py',
-                    '--region', self.region
-                ], capture_output=True, text=True)
+                    'python', codebuild_script,
+                    '--region', self.region,
+                    '--environment', self.environment
+                ], capture_output=True, text=True, cwd=project_root)
                 
                 if result.returncode == 0:
                     logger.info("  ✓ Containers built via CodeBuild")
@@ -394,11 +403,10 @@ class EnhancedMLOpsDeployer:
                 logger.error("  ✗ Docker ECR login failed")
                 return False
             
-            # Build and push each container
+            # Updated container directories for sdcp_code structure
             container_dirs = {
-                'energy-preprocessing': 'containers/preprocessing',
-                'energy-training': 'containers/training',
-                # 'energy-prediction': 'containers/prediction'
+                'energy-preprocessing': os.path.join(sdcp_code_dir, 'containers', 'preprocessing'),
+                'energy-training': os.path.join(sdcp_code_dir, 'containers', 'training'),
             }
             
             for repo_name, container_dir in container_dirs.items():
@@ -407,24 +415,26 @@ class EnhancedMLOpsDeployer:
                     continue
                 
                 image_uri = f"{self.account_id}.dkr.ecr.{self.region}.amazonaws.com/{repo_name}:latest"
+                env_image_uri = f"{self.account_id}.dkr.ecr.{self.region}.amazonaws.com/{repo_name}:{self.environment}-latest"
                 
                 # Build
                 build_result = subprocess.run([
-                    'docker', 'build', '-t', image_uri, container_dir
+                    'docker', 'build', '-t', image_uri, '-t', env_image_uri, container_dir
                 ], capture_output=True, text=True)
                 
                 if build_result.returncode != 0:
                     logger.error(f"  ✗ Failed to build {repo_name}: {build_result.stderr}")
                     return False
                 
-                # Push
-                push_result = subprocess.run([
-                    'docker', 'push', image_uri
-                ], capture_output=True, text=True)
-                
-                if push_result.returncode != 0:
-                    logger.error(f"  ✗ Failed to push {repo_name}: {push_result.stderr}")
-                    return False
+                # Push both tags
+                for push_uri in [image_uri, env_image_uri]:
+                    push_result = subprocess.run([
+                        'docker', 'push', push_uri
+                    ], capture_output=True, text=True)
+                    
+                    if push_result.returncode != 0:
+                        logger.error(f"  ✗ Failed to push {push_uri}: {push_result.stderr}")
+                        return False
                 
                 logger.info(f"  ✓ Built and pushed: {repo_name}")
             
@@ -436,51 +446,55 @@ class EnhancedMLOpsDeployer:
     
     def _setup_enhanced_eventbridge(self) -> Dict[str, Any]:
         """Setup enhanced EventBridge rules for both prediction and training pipelines"""
-       
+        
         try:
-            # Create enhanced EventBridge rules
-            sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'infrastructure'))
+            # Updated import path for sdcp_code structure
+            infrastructure_path = os.path.join(sdcp_code_dir, 'infrastructure')
+            if infrastructure_path not in sys.path:
+                sys.path.append(infrastructure_path)
+            
             from step_functions_definitions import create_enhanced_eventbridge_rules
-           
+            
             # Get state machine ARNs
             state_machines = self.stepfunctions_client.list_state_machines()
-           
+            
             enhanced_prediction_arn = None
             training_pipeline_arn = None
-           
+            
             for sm in state_machines['stateMachines']:
                 if sm['name'] == self.config['enhanced_prediction_state_machine']:
                     enhanced_prediction_arn = sm['stateMachineArn']
                 elif sm['name'] == self.config['training_state_machine']:
                     training_pipeline_arn = sm['stateMachineArn']
-           
+            
             if not enhanced_prediction_arn:
-                raise Exception("Enhanced prediction state machine not found")
-               
+                raise Exception(f"Enhanced prediction state machine not found: {self.config['enhanced_prediction_state_machine']}")
+                
             if not training_pipeline_arn:
-                raise Exception("Training pipeline state machine not found")
-           
+                raise Exception(f"Training pipeline state machine not found: {self.config['training_state_machine']}")
+            
             # Create EventBridge rules for both pipelines
             state_machine_arns = {
                 'enhanced_prediction_pipeline': enhanced_prediction_arn,
                 'training_pipeline': training_pipeline_arn
             }
-           
+            
             rules_result = create_enhanced_eventbridge_rules(
                 self.account_id,
                 self.region,
-                state_machine_arns
+                state_machine_arns,
+                environment=self.environment  # Pass environment for naming
             )
-           
+            
             logger.info("✓ Enhanced EventBridge rules created successfully")
-           
+            
             return {
                 'status': 'success',
                 'rules_created': rules_result,
                 'enhanced_prediction_arn': enhanced_prediction_arn,
                 'training_pipeline_arn': training_pipeline_arn
             }
-           
+            
         except Exception as e:
             logger.error(f"Enhanced EventBridge setup failed: {str(e)}")
             return {
@@ -488,72 +502,20 @@ class EnhancedMLOpsDeployer:
                 'error': str(e)
             }
 
-    def manage_eventbridge_schedules(region: str, action: str = 'status'):
-        """
-        Manage EventBridge schedules - enable, disable, or check status
-       
-        Args:
-            region: AWS region
-            action: 'enable', 'disable', or 'status'
-        """
-       
-        events_client = boto3.client('events', region_name=region)
-       
-        rules = [
-            'energy-forecasting-enhanced-daily-predictions',
-            'energy-forecasting-monthly-training-pipeline'
-        ]
-       
-        results = {}
-       
-        for rule_name in rules:
-            try:
-                # Get current status
-                rule_info = events_client.describe_rule(Name=rule_name)
-                current_state = rule_info['State']
-               
-                if action == 'status':
-                    results[rule_name] = {
-                        'current_state': current_state,
-                        'schedule': rule_info.get('ScheduleExpression', 'No schedule'),
-                        'description': rule_info.get('Description', 'No description')
-                    }
-                   
-                elif action == 'enable':
-                    if current_state != 'ENABLED':
-                        events_client.enable_rule(Name=rule_name)
-                        results[rule_name] = f"Enabled (was {current_state})"
-                    else:
-                        results[rule_name] = "Already enabled"
-                       
-                elif action == 'disable':
-                    if current_state != 'DISABLED':
-                        events_client.disable_rule(Name=rule_name)
-                        results[rule_name] = f"Disabled (was {current_state})"
-                    else:
-                        results[rule_name] = "Already disabled"
-                       
-            except events_client.exceptions.ResourceNotFoundException:
-                results[rule_name] = "Rule not found"
-            except Exception as e:
-                results[rule_name] = f"Error: {str(e)}"
-       
-        return results
-
     def _validate_complete_deployment(self) -> Dict[str, Any]:
         """Validate complete deployment including training schedules"""
-       
+        
         try:
             validation_results = {}
-           
-            # Check Lambda functions
+            
+            # Environment-aware Lambda function names
             lambda_functions = [
-                'energy-forecasting-profile-validator',
-                'energy-forecasting-profile-endpoint-creator',
-                'energy-forecasting-profile-predictor',
-                'energy-forecasting-profile-cleanup'
+                f'energy-forecasting-{self.environment}-profile-validator',
+                f'energy-forecasting-{self.environment}-profile-endpoint-creator',
+                f'energy-forecasting-{self.environment}-profile-predictor',
+                f'energy-forecasting-{self.environment}-profile-cleanup'
             ]
-           
+            
             lambda_status = {}
             for func_name in lambda_functions:
                 try:
@@ -572,15 +534,15 @@ class EnhancedMLOpsDeployer:
                         'exists': False,
                         'error': str(e)
                     }
-           
+            
             validation_results['lambda_functions'] = lambda_status
-           
-            # Check Step Functions
+            
+            # Environment-aware Step Function names
             state_machines = [
-                'energy-forecasting-enhanced-prediction-pipeline',
-                'energy-forecasting-training-pipeline'  # Added training pipeline validation
+                self.config['enhanced_prediction_state_machine'],
+                self.config['training_state_machine']
             ]
-           
+            
             stepfunctions_status = {}
             for sm_name in state_machines:
                 try:
@@ -601,44 +563,45 @@ class EnhancedMLOpsDeployer:
                         'exists': False,
                         'error': str(e)
                     }
-           
+            
             validation_results['step_functions'] = stepfunctions_status
-           
-            # Check EventBridge rules (both prediction and training)
+            
+            # Environment-aware EventBridge rule names
             try:
                 rules = self.events_client.list_rules()
-                energy_rules = [rule for rule in rules['Rules'] if 'energy-forecasting' in rule['Name']]
-               
+                energy_rules = [rule for rule in rules['Rules'] 
+                              if f'energy-forecasting-{self.environment}' in rule['Name']]
+                
                 expected_rules = [
-                    'energy-forecasting-enhanced-daily-predictions',
-                    'energy-forecasting-monthly-training-pipeline'  # Added training schedule validation
+                    f'energy-forecasting-{self.environment}-enhanced-daily-predictions',
+                    f'energy-forecasting-{self.environment}-monthly-training-pipeline'
                 ]
-               
+                
                 found_rules = [rule['Name'] for rule in energy_rules]
-               
+                
                 validation_results['eventbridge_rules'] = {
                     'rules_count': len([rule for rule in found_rules if rule in expected_rules]),
                     'rules_found': [rule for rule in found_rules if rule in expected_rules],
                     'rules_missing': [rule for rule in expected_rules if rule not in found_rules],
                     'all_expected_rules': expected_rules
                 }
-               
+                
             except Exception as e:
                 validation_results['eventbridge_rules'] = {
                     'error': str(e)
                 }
-           
+            
             # Overall assessment
             lambda_success = sum(1 for status in lambda_status.values() if status.get('exists'))
             stepfunctions_success = sum(1 for status in stepfunctions_status.values() if status.get('exists'))
             eventbridge_success = validation_results.get('eventbridge_rules', {}).get('rules_count', 0)
-           
+            
             overall_success = (
                 lambda_success == len(lambda_functions) and
                 stepfunctions_success == len(state_machines) and
-                eventbridge_success >= 2  # Both prediction and training rules
+                eventbridge_success >= 2
             )
-           
+            
             return {
                 'status': 'success' if overall_success else 'partial',
                 'overall_success': overall_success,
@@ -650,7 +613,7 @@ class EnhancedMLOpsDeployer:
                     'deployment_complete': overall_success
                 }
             }
-           
+            
         except Exception as e:
             return {
                 'status': 'failed',
@@ -703,15 +666,16 @@ class EnhancedMLOpsDeployer:
         """Test Lambda function connectivity"""
         
         try:
-            # Test profile validator
+            # Test profile validator with environment-aware naming
             test_event = {
                 "operation": "validate_and_filter_profiles",
                 "profiles": ["RNN"],
                 "data_bucket": self.config['data_bucket']
             }
             
+            function_name = f'energy-forecasting-{self.environment}-profile-validator'
             response = self.lambda_client.invoke(
-                FunctionName='energy-forecasting-profile-validator',
+                FunctionName=function_name,
                 InvocationType='RequestResponse',
                 Payload=json.dumps(test_event)
             )
@@ -775,8 +739,9 @@ class EnhancedMLOpsDeployer:
                 "data_bucket": self.config['data_bucket']
             }
             
+            function_name = f'energy-forecasting-{self.environment}-profile-validator'
             response = self.lambda_client.invoke(
-                FunctionName='energy-forecasting-profile-validator',
+                FunctionName=function_name,
                 InvocationType='RequestResponse',
                 Payload=json.dumps(test_event)
             )

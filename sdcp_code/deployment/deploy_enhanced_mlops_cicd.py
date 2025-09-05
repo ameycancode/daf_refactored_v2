@@ -1,10 +1,10 @@
 # =============================================================================
-# ENHANCED DEPLOYMENT SCRIPT - deployment/deploy_enhanced_mlops_cicd.py
+# ENHANCED DEPLOYMENT SCRIPT - sdcp_code/deployment/deploy_enhanced_mlops_cicd.py
 # =============================================================================
 """
 Enhanced MLOps Deployment Script with CI/CD Integration
 This script enhances the existing deploy_enhanced_mlops.py with CI/CD capabilities
-while maintaining the core deployment logic
+while maintaining the core deployment logic and integrating lambda_deployer.py
 """
 
 import sys
@@ -14,20 +14,26 @@ import argparse
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional
+from pathlib import Path
 
-# Import the original deployment class
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add sdcp_code to path for proper imports
+script_dir = Path(__file__).parent
+sdcp_code_dir = script_dir.parent
+sys.path.insert(0, str(sdcp_code_dir))
+
+# Import the original deployment class and lambda deployer
 try:
-    from deploy_enhanced_mlops import EnhancedMLOpsDeployment
-except ImportError:
-    print("Error: Could not import deploy_enhanced_mlops.py")
-    print("Make sure the original deployment script exists in the same directory")
+    from deployment.deploy_enhanced_mlops import EnhancedMLOpsDeployer
+    from deployment.lambda_deployer import CompleteLambdaDeployer
+except ImportError as e:
+    print(f"Error: Could not import required modules: {str(e)}")
+    print("Make sure deploy_enhanced_mlops.py and lambda_deployer.py exist in the deployment directory")
     sys.exit(1)
 
-class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
+class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployer):
     """
     CI/CD Enhanced MLOps Deployment
-    Extends the original deployment with CI/CD-specific features
+    Extends the original deployment with CI/CD-specific features and lambda deployer integration
     """
     
     def __init__(self, environment: str, region: str = "us-west-2", 
@@ -49,6 +55,13 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
         # Environment-specific configuration
         self.env_config = self._get_environment_config()
         
+        # Initialize lambda deployer with environment-aware configuration
+        self.lambda_deployer = CompleteLambdaDeployer(
+            region=region,
+            environment=environment,
+            role_name=self.env_config["role_name"]
+        )
+        
         # CI/CD specific logging setup
         if ci_cd_mode:
             self._setup_cicd_logging()
@@ -56,6 +69,7 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
         self.logger.info(f"CI/CD Enhanced MLOps Deployment initialized for {environment} environment")
         self.logger.info(f"CI/CD Mode: {ci_cd_mode}")
         self.logger.info(f"GitHub Run ID: {github_run_id}")
+        self.logger.info(f"Lambda Deployer initialized for environment: {environment}")
     
     def _get_environment_config(self) -> Dict[str, Any]:
         """Get environment-specific configuration"""
@@ -140,7 +154,12 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
             self._cicd_step("Container Configuration", deployment_summary)
             self._setup_environment_aware_containers()
             
-            # Step 3: Call original deployment method with environment parameters
+            # Step 3: Enhanced Lambda Function Deployment
+            self._cicd_step("Lambda Functions Deployment", deployment_summary)
+            lambda_result = self._deploy_lambda_functions_enhanced()
+            deployment_summary["resources_deployed"]["lambda_functions"] = lambda_result
+            
+            # Step 4: Call original deployment method with environment parameters
             self._cicd_step("Core MLOps Deployment", deployment_summary)
             
             # Override bucket names for environment-aware deployment
@@ -150,21 +169,21 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
             self.data_bucket = self.env_config["data_bucket"]
             self.model_bucket = self.env_config["model_bucket"]
             
-            # Call the original deployment method
-            core_deployment_result = self.deploy_complete_enhanced_mlops()
+            # Call the original deployment method (skipping lambda deployment since we did it above)
+            core_deployment_result = self.deploy_complete_enhanced_mlops(skip_lambda_deployment=True)
             
             # Restore original bucket names
             self.data_bucket = original_data_bucket
             self.model_bucket = original_model_bucket
             
-            deployment_summary["resources_deployed"] = core_deployment_result
+            deployment_summary["resources_deployed"]["core_deployment"] = core_deployment_result
             
-            # Step 4: Post-deployment validation
+            # Step 5: Post-deployment validation
             self._cicd_step("Post-deployment Validation", deployment_summary)
             post_validation = self._validate_post_deployment()
             deployment_summary["validation_results"]["post_deployment"] = post_validation
             
-            # Step 5: CI/CD specific reporting
+            # Step 6: CI/CD specific reporting
             self._cicd_step("CI/CD Reporting", deployment_summary)
             self._generate_cicd_artifacts(deployment_summary)
             
@@ -193,6 +212,49 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
             
             raise
     
+    def _deploy_lambda_functions_enhanced(self) -> Dict[str, Any]:
+        """Deploy Lambda functions using the enhanced lambda deployer"""
+        self.logger.info("Deploying Lambda functions using enhanced deployer...")
+        
+        lambda_results = {
+            "functions_deployed": [],
+            "functions_failed": [],
+            "deployment_summary": {}
+        }
+        
+        try:
+            # Get lambda functions directory path (accounting for sdcp_code structure)
+            lambda_functions_dir = sdcp_code_dir / "lambda-functions"
+            
+            if not lambda_functions_dir.exists():
+                raise Exception(f"Lambda functions directory not found: {lambda_functions_dir}")
+            
+            # Deploy all lambda functions
+            deployment_result = self.lambda_deployer.deploy_all_functions(
+                lambda_functions_dir=str(lambda_functions_dir),
+                environment_prefix=self.env_config["lambda_prefix"]
+            )
+            
+            lambda_results["deployment_summary"] = deployment_result
+            
+            # Process deployment results
+            for function_name, result in deployment_result.items():
+                if result.get("success", False):
+                    lambda_results["functions_deployed"].append(function_name)
+                    self.logger.info(f"✓ Lambda function deployed: {function_name}")
+                else:
+                    lambda_results["functions_failed"].append(function_name)
+                    self.logger.error(f"✗ Lambda function failed: {function_name}")
+            
+            self.logger.info(f"Lambda deployment completed: {len(lambda_results['functions_deployed'])} succeeded, {len(lambda_results['functions_failed'])} failed")
+            
+        except Exception as e:
+            self.logger.error(f"Lambda functions deployment failed: {str(e)}")
+            lambda_results["error"] = str(e)
+            raise
+        
+        return lambda_results
+    
     def _cicd_step(self, step_name: str, deployment_summary: Dict[str, Any]):
         """Track CI/CD deployment steps"""
         self.logger.info(f">>> CI/CD STEP: {step_name}")
@@ -209,7 +271,8 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
             "aws_credentials": False,
             "s3_buckets": False,
             "iam_roles": False,
-            "environment_config": False
+            "environment_config": False,
+            "lambda_functions_directory": False
         }
         
         try:
@@ -242,6 +305,14 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
                 validation_results["environment_config"] = True
                 self.logger.info("✓ Environment configuration validation passed")
             
+            # Validate lambda functions directory
+            lambda_functions_dir = sdcp_code_dir / "lambda-functions"
+            if lambda_functions_dir.exists():
+                validation_results["lambda_functions_directory"] = True
+                self.logger.info(f"✓ Lambda functions directory exists: {lambda_functions_dir}")
+            else:
+                self.logger.error(f"✗ Lambda functions directory missing: {lambda_functions_dir}")
+            
         except Exception as e:
             self.logger.error(f"Pre-deployment validation error: {str(e)}")
         
@@ -252,8 +323,8 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
         self.logger.info("Setting up environment-aware container configurations...")
         
         try:
-            # Generate container configurations for current environment
-            from container_config_manager import ContainerConfigManager
+            # Import container config manager from proper path
+            from deployment.container_config_manager import ContainerConfigManager
             
             config_manager = ContainerConfigManager(
                 environment=self.environment,
@@ -289,14 +360,10 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
         }
         
         try:
-            # Validate Lambda functions
-            expected_functions = [
-                f"{self.env_config['lambda_prefix']}-model-registry",
-                f"{self.env_config['lambda_prefix']}-endpoint-management",
-                f"{self.env_config['lambda_prefix']}-profile-validator",
-                f"{self.env_config['lambda_prefix']}-profile-predictor",
-                f"{self.env_config['lambda_prefix']}-prediction-summary"
-            ]
+            # Validate Lambda functions using lambda deployer
+            expected_functions = self.lambda_deployer.get_expected_function_names(
+                environment_prefix=self.env_config["lambda_prefix"]
+            )
             
             for function_name in expected_functions:
                 try:
@@ -371,6 +438,10 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
         if not summary_file:
             return
         
+        lambda_functions = deployment_summary.get('resources_deployed', {}).get('lambda_functions', {})
+        lambda_deployed = len(lambda_functions.get('functions_deployed', []))
+        lambda_failed = len(lambda_functions.get('functions_failed', []))
+        
         with open(summary_file, 'a') as f:
             f.write(f"""
 ## 🚀 MLOps Deployment Summary - {self.environment.upper()}
@@ -383,7 +454,7 @@ class CICDEnhancedMLOpsDeployment(EnhancedMLOpsDeployment):
 | GitHub Run ID | `{self.github_run_id}` |
 
 ### Resources Deployed
-- **Lambda Functions**: {len(deployment_summary['validation_results'].get('post_deployment', {}).get('lambda_functions', []))} functions
+- **Lambda Functions**: {lambda_deployed} deployed, {lambda_failed} failed
 - **Step Functions**: {len(deployment_summary['validation_results'].get('post_deployment', {}).get('step_functions', []))} pipelines
 - **S3 Buckets**: Data and Model buckets configured
 - **Container Images**: Environment-specific configurations applied

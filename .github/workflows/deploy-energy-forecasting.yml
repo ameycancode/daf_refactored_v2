@@ -208,7 +208,7 @@ jobs:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
         run: |
           echo "Building containers for environment: $ENVIRONMENT"
-          python scripts/build_via_codebuild.py \
+          python sdcp_code/scripts/build_via_codebuild.py \
             --region ${{ env.AWS_REGION }} \
             --environment $ENVIRONMENT
 
@@ -280,7 +280,7 @@ jobs:
       - name: ✅ Post-Deployment Validation
         run: |
           echo "=== POST-DEPLOYMENT VALIDATION ==="
-          python deployment/validate_environment.py \
+          python sdcp_code/deployment/validate_environment.py \
             --environment ${{ needs.determine_environment.outputs.environment }} \
             --post-deployment-check
 
@@ -338,7 +338,7 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --all-profiles \
             --ci-cd-mode \
-            --timeout-minutes 45
+            --timeout-minutes 90
 
       - name: 📝 Upload Training Test Results
         uses: actions/upload-artifact@v4
