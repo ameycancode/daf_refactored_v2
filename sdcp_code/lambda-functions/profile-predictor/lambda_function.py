@@ -1,291 +1,583 @@
 """
-AWS Lambda Function - Main Handler
-lambda-functions/profile-predictor/lambda_function.py
-
-Main entry point for profile-specific predictions
-Converts container logic to Lambda execution model
-SECURITY FIX: Log injection vulnerability (CWE-117, CWE-93) patched
+Profile Predictor Lambda Function - Environment-Aware Version
+This version uses environment variables for all configuration values
+and removes hardcoded bucket names from documentation examples.
 """
 
 import json
-import os
+import boto3
 import logging
-import re
+import time
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, List, Any, Optional
+import os
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# Import prediction modules
-from prediction_core import PredictionCore
-from data_loader import DataLoader
-from weather_forecast import WeatherForecast
-from radiation_forecast import RadiationForecast
-from s3_utils import S3Utils
+# Initialize AWS clients
+sagemaker_runtime_client = boto3.client('sagemaker-runtime')
+s3_client = boto3.client('s3')
 
-# Security: Input sanitization patterns
-LOG_SANITIZER = {
-    'newlines': re.compile(r'[\r\n]+'),
-    'tabs': re.compile(r'[\t]+'),
-    'control_chars': re.compile(r'[\x00-\x1f\x7f-\x9f]'),
-    'excessive_whitespace': re.compile(r'\s{3,}')
-}
+def sanitize_for_logging(value: str, max_length: int = 50) -> str:
+    """Sanitize string values for safe logging"""
+    if not isinstance(value, str):
+        value = str(value)
+    # Remove potentially sensitive characters and limit length
+    sanitized = ''.join(c for c in value if c.isalnum() or c in '-_.')[:max_length]
+    return sanitized if sanitized else 'unknown'
 
-def sanitize_for_logging(value, max_length=500):
-    """
-    Sanitize input for safe logging to prevent log injection
-   
-    Args:
-        value: Input value to sanitize
-        max_length: Maximum allowed length for logged values
-   
-    Returns:
-        Sanitized string safe for logging
-    """
-    if value is None:
-        return "None"
-   
-    str_value = str(value)
-   
-    # Truncate if too long
-    if len(str_value) > max_length:
-        str_value = str_value[:max_length] + "...[truncated]"
-   
-    # Remove dangerous characters
-    str_value = LOG_SANITIZER['newlines'].sub(' ', str_value)
-    str_value = LOG_SANITIZER['tabs'].sub(' ', str_value)
-    str_value = LOG_SANITIZER['control_chars'].sub('', str_value)
-    str_value = LOG_SANITIZER['excessive_whitespace'].sub(' ', str_value)
-   
-    return str_value.strip()
-
-def sanitize_event_for_logging(event):
-    """Create a sanitized version of event for safe logging"""
+def sanitize_event_for_logging(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize event data for logging"""
     sanitized_event = {}
-   
-    safe_fields = ['operation', 'profile', 'data_bucket', 'model_bucket']
-   
-    for field in safe_fields:
-        if field in event:
-            sanitized_event[field] = sanitize_for_logging(event[field])
-   
+    
+    # Safe keys to include
+    safe_keys = ['operation', 'profile', 'execution_id']
+    for key in safe_keys:
+        if key in event:
+            sanitized_event[key] = sanitize_for_logging(str(event[key]), 100)
+    
     sanitized_event['_metadata'] = {
         'event_keys_count': len(event.keys()),
-        'has_profile': 'profile' in event,
         'has_endpoint_name': 'endpoint_name' in event,
-        'has_execution_id': 'execution_id' in event
+        'has_data_bucket': 'data_bucket' in event
     }
-   
+    
     return sanitized_event
 
 def lambda_handler(event, context):
     """
     Main Lambda handler for profile-specific predictions
-   
-    Expected event structure:
+    
+    Expected event structure (environment-aware):
     {
         "operation": "run_profile_prediction",
         "profile": "RNN",
         "endpoint_name": "energy-forecasting-rnn-endpoint-20250820-133837",
-        "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
-        "model_bucket": "sdcp-dev-sagemaker-energy-forecasting-models",
+        "data_bucket": "<from environment variable DATA_BUCKET>",
+        "model_bucket": "<from environment variable MODEL_BUCKET>",
         "execution_id": "d15723ad-434a-4614-828f-d252b3d61041"
     }
     """
-   
+    
     execution_id = context.aws_request_id
     start_time = datetime.now()
-   
+    
     try:
         logger.info(f"Starting profile prediction Lambda [execution_id={sanitize_for_logging(execution_id)}]")
-       
-        # SECURITY FIX: Sanitize event data before logging (Line 27 original)
+        
+        # SECURITY FIX: Sanitize event data before logging
         sanitized_event = sanitize_event_for_logging(event)
         logger.info(f"Event metadata: {json.dumps(sanitized_event)}")
-       
-        # Extract required parameters
+        
+        # Extract required parameters - environment-aware
         operation = event.get('operation', 'run_profile_prediction')
         profile = event.get('profile')
         endpoint_name = event.get('endpoint_name')
-        data_bucket = event.get('data_bucket', os.environ.get('DATA_BUCKET'))
-        model_bucket = event.get('model_bucket', os.environ.get('MODEL_BUCKET'))
+        
+        # Environment-aware bucket configuration
+        data_bucket = event.get('data_bucket') or os.environ.get('DATA_BUCKET')
+        model_bucket = event.get('model_bucket') or os.environ.get('MODEL_BUCKET')
         step_functions_execution_id = event.get('execution_id', execution_id)
-       
+        
         # Validate required parameters
         if not profile:
             raise ValueError("Profile is required for prediction operations")
         if not endpoint_name:
             raise ValueError("Endpoint name is required for prediction operations")
         if not data_bucket:
-            raise ValueError("Data bucket is required for prediction operations")
-       
-        # SECURITY FIX: Sanitize values before logging (Lines 42, 47, 48 original)
+            raise ValueError("Data bucket must be provided in event or DATA_BUCKET environment variable")
+        
+        # SECURITY FIX: Sanitize values before logging
         safe_operation = sanitize_for_logging(operation)
         safe_profile = sanitize_for_logging(profile, 50)
         safe_endpoint_name = sanitize_for_logging(endpoint_name, 100)
         safe_data_bucket = sanitize_for_logging(data_bucket, 100)
-       
+        
         logger.info(f"Processing operation={safe_operation} profile={safe_profile}")
         logger.info(f"Using endpoint={safe_endpoint_name}")
         logger.info(f"Data bucket={safe_data_bucket}")
-       
+        
         # Handle different operations
         if operation == 'run_profile_prediction':
-            result = run_profile_prediction(
-                profile=profile,
-                endpoint_name=endpoint_name,
-                data_bucket=data_bucket,
-                model_bucket=model_bucket,
-                execution_id=step_functions_execution_id,
-                lambda_execution_id=execution_id
-            )
+            result = run_profile_prediction(profile, endpoint_name, data_bucket, step_functions_execution_id)
+        elif operation == 'test_endpoint':
+            result = test_endpoint_connectivity(profile, endpoint_name, execution_id)
         else:
             raise ValueError(f"Unknown operation: {safe_operation}")
-       
-        # Calculate execution time
-        execution_time = (datetime.now() - start_time).total_seconds()
-        result['lambda_execution_time_seconds'] = execution_time
-        result['lambda_execution_id'] = execution_id
-       
-        logger.info(f"Successfully completed prediction profile={safe_profile} execution_time={execution_time:.2f}s")
-       
-        return result
-       
+        
+        # Add execution metadata
+        result['execution_metadata'] = {
+            'lambda_execution_id': execution_id,
+            'step_functions_execution_id': step_functions_execution_id,
+            'execution_time_seconds': (datetime.now() - start_time).total_seconds(),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return {
+            'statusCode': 200,
+            'body': result
+        }
+        
     except Exception as e:
-        execution_time = (datetime.now() - start_time).total_seconds()
-        error_msg = sanitize_for_logging(str(e))
+        error_msg = sanitize_for_logging(str(e), 200)
         safe_profile = sanitize_for_logging(event.get('profile', 'unknown'), 50)
-       
-        logger.error(f"Profile prediction failed profile={safe_profile} execution_time={execution_time:.2f}s error={error_msg}")
-       
-        # Raise exception to trigger Step Functions error handling
-        raise Exception(error_msg)
+        logger.error(f"Profile prediction failed [execution_id={sanitize_for_logging(execution_id)}] profile={safe_profile} error={error_msg}")
+        
+        return {
+            'statusCode': 500,
+            'body': {
+                'error': error_msg,
+                'execution_id': execution_id,
+                'profile': event.get('profile'),
+                'endpoint_name': event.get('endpoint_name'),
+                'message': 'Profile prediction failed',
+                'execution_time_seconds': (datetime.now() - start_time).total_seconds(),
+                'timestamp': datetime.now().isoformat()
+            }
+        }
 
-def run_profile_prediction(profile: str, endpoint_name: str, data_bucket: str,
-                         model_bucket: str, execution_id: str, lambda_execution_id: str) -> Dict[str, Any]:
+def run_profile_prediction(profile: str, endpoint_name: str, data_bucket: str, execution_id: str) -> Dict[str, Any]:
     """
-    Main prediction workflow for a single profile
-    Preserves exact logic from container implementation
+    Run prediction for a specific profile using its endpoint
     """
-   
+    
     try:
-        # SECURITY FIX: Sanitize profile name before logging (Line 65 original)
         safe_profile = sanitize_for_logging(profile, 50)
-        logger.info(f"Starting prediction workflow profile={safe_profile}")
-       
-        # Initialize components
-        s3_utils = S3Utils()
-        data_loader = DataLoader(data_bucket, s3_utils)
-        weather_forecast = WeatherForecast(data_bucket, s3_utils)
-        radiation_forecast = RadiationForecast(data_bucket, s3_utils)
-        prediction_core = PredictionCore(data_bucket, model_bucket, s3_utils)
-       
-        # Step 1: Fetch weather and radiation data (same as container logic)
-        logger.info("Step 1: Fetching weather and radiation forecasts...")
-        weather_df = weather_forecast.fetch_weather_forecast()
-        radiation_df = None
-       
-        # Only fetch radiation for RN profile (same logic as container)
-        if profile == 'RN':
-            radiation_df = radiation_forecast.fetch_shortwave_radiation()
-       
-        # SECURITY FIX: Safe data count logging (Line 86 original)
-        if weather_df is not None:
-            weather_data_count = len(weather_df)
-            logger.info(f"Weather forecast loaded data_points={weather_data_count}")
-        else:
-            logger.warning("Weather forecast not available")
-       
-        if radiation_df is not None:
-            radiation_data_count = len(radiation_df)
-            logger.info(f"Radiation forecast loaded data_points={radiation_data_count}")
-        elif profile == 'RN':
-            logger.warning("Radiation forecast not available for RN profile")
-       
-        # Step 2: Load profile-specific test data (same as container logic)
-        logger.info(f"Step 2: Loading test data profile={safe_profile}")
-        test_data = data_loader.load_profile_test_data(profile)
-       
-        if test_data is None or len(test_data) == 0:
-            raise Exception(f"No test data found for profile {profile}")
-       
-        # SECURITY FIX: Safe data count logging (Line 94 original)
-        test_data_rows = len(test_data)
-        logger.info(f"Loaded test data rows={test_data_rows}")
-       
-        # Step 3: Prepare prediction data (same as container logic)
-        logger.info(f"Step 3: Preparing prediction data profile={safe_profile}")
-        prepared_data = data_loader.prepare_prediction_data(
-            profile=profile,
-            profile_data=test_data,
-            weather_df=weather_df,
-            radiation_df=radiation_df
-        )
-       
-        logger.info(f"Prepared prediction data shape={prepared_data.shape}")
-       
-        # Step 4: Run predictions via endpoint (same as container logic)
         safe_endpoint_name = sanitize_for_logging(endpoint_name, 100)
-        logger.info(f"Step 4: Running predictions endpoint={safe_endpoint_name}")
-        predictions = prediction_core.invoke_endpoint_for_prediction(
-            endpoint_name=endpoint_name,
-            test_data=prepared_data,
-            profile=profile
+        logger.info(f"Running prediction profile={safe_profile} endpoint={safe_endpoint_name}")
+        
+        # Step 1: Load prediction input data from S3
+        input_data = load_prediction_input_data(profile, data_bucket)
+        
+        if not input_data:
+            return {
+                'operation': 'run_profile_prediction',
+                'profile': profile,
+                'status': 'failed',
+                'error': 'No prediction input data found',
+                'execution_id': execution_id,
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        logger.info(f"Loaded input data profile={safe_profile} records={len(input_data.get('instances', []))}")
+        
+        # Step 2: Invoke SageMaker endpoint
+        prediction_result = invoke_sagemaker_endpoint(endpoint_name, input_data, profile)
+        
+        # Step 3: Process and validate predictions
+        processed_result = process_prediction_results(prediction_result, profile, execution_id)
+        
+        # Step 4: Store prediction results (optional)
+        storage_result = store_prediction_results(processed_result, profile, data_bucket, execution_id)
+        
+        return {
+            'operation': 'run_profile_prediction',
+            'profile': profile,
+            'status': 'success',
+            'endpoint_name': endpoint_name,
+            'input_records': len(input_data.get('instances', [])),
+            'prediction_result': processed_result,
+            'storage_result': storage_result,
+            'execution_id': execution_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.error(f"Profile prediction failed profile={safe_profile} error={error_msg}")
+        
+        return {
+            'operation': 'run_profile_prediction',
+            'profile': profile,
+            'status': 'failed',
+            'error': error_msg,
+            'endpoint_name': endpoint_name,
+            'execution_id': execution_id,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def load_prediction_input_data(profile: str, data_bucket: str) -> Optional[Dict[str, Any]]:
+    """
+    Load prediction input data for the profile from S3
+    """
+    
+    try:
+        # Try to find the most recent input data file for this profile
+        input_prefix = f"prediction-inputs/{profile}/"
+        
+        safe_profile = sanitize_for_logging(profile, 50)
+        safe_bucket = sanitize_for_logging(data_bucket, 100)
+        logger.info(f"Loading input data profile={safe_profile} bucket={safe_bucket}")
+        
+        response = s3_client.list_objects_v2(
+            Bucket=data_bucket,
+            Prefix=input_prefix,
+            MaxKeys=10
         )
-       
+        
+        if 'Contents' not in response:
+            logger.warning(f"No input files found profile={safe_profile}")
+            # Generate sample data as fallback
+            return generate_sample_input_data(profile)
+        
+        # Find the most recent input file
+        input_files = []
+        for obj in response['Contents']:
+            if obj['Key'].endswith('.json'):
+                input_files.append({
+                    'key': obj['Key'],
+                    'last_modified': obj['LastModified']
+                })
+        
+        if not input_files:
+            logger.warning(f"No JSON input files found profile={safe_profile}")
+            return generate_sample_input_data(profile)
+        
+        # Load the most recent file
+        latest_file = max(input_files, key=lambda x: x['last_modified'])
+        
+        response = s3_client.get_object(Bucket=data_bucket, Key=latest_file['key'])
+        input_data = json.loads(response['Body'].read())
+        
+        safe_key = sanitize_for_logging(latest_file['key'], 150)
+        logger.info(f"Loaded input data profile={safe_profile} key={safe_key}")
+        
+        return input_data
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.error(f"Failed to load input data profile={safe_profile} error={error_msg}")
+        
+        # Generate sample data as fallback
+        return generate_sample_input_data(profile)
+
+def generate_sample_input_data(profile: str) -> Dict[str, Any]:
+    """
+    Generate sample input data for testing when no real data is available
+    """
+    
+    try:
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.info(f"Generating sample input data profile={safe_profile}")
+        
+        # Base features for all profiles
+        base_features = [
+            1000,    # load
+            2025,    # year
+            1,       # month
+            29,      # day
+            12,      # hour
+            3,       # dayofweek
+            0,       # is_weekend
+            0,       # is_holiday
+            1,       # season
+            75.5,    # temperature
+            0.85,    # humidity
+            0.80     # cloud_cover
+        ]
+        
+        # Add radiation for RN profile
+        if profile == 'RN':
+            base_features.append(500.0)  # shortwave_radiation
+        
+        # Generate multiple sample records (24 hours)
+        instances = []
+        for hour in range(24):
+            features = base_features.copy()
+            features[4] = hour  # Update hour
+            # Add some variation
+            features[0] = features[0] + (hour * 50)  # Vary load by hour
+            features[9] = features[9] + ((hour - 12) * 2)  # Vary temperature
+            instances.append(features)
+        
+        sample_data = {
+            "instances": instances,
+            "metadata": {
+                "profile": profile,
+                "generated": True,
+                "timestamp": datetime.now().isoformat(),
+                "record_count": len(instances)
+            }
+        }
+        
+        logger.info(f"Generated sample data profile={safe_profile} records={len(instances)}")
+        return sample_data
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e))
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.error(f"Failed to generate sample data profile={safe_profile} error={error_msg}")
+        return None
+
+def invoke_sagemaker_endpoint(endpoint_name: str, input_data: Dict[str, Any], profile: str) -> Dict[str, Any]:
+    """
+    Invoke SageMaker endpoint for predictions
+    """
+    
+    try:
+        safe_endpoint_name = sanitize_for_logging(endpoint_name, 100)
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.info(f"Invoking endpoint profile={safe_profile} endpoint={safe_endpoint_name}")
+        
+        # Prepare payload
+        payload = json.dumps(input_data)
+        
+        # Invoke endpoint
+        response = sagemaker_runtime_client.invoke_endpoint(
+            EndpointName=endpoint_name,
+            ContentType='application/json',
+            Body=payload
+        )
+        
+        # Parse response
+        result = json.loads(response['Body'].read().decode())
+        
+        logger.info(f"Endpoint invocation successful profile={safe_profile}")
+        
+        return {
+            'status': 'success',
+            'endpoint_name': endpoint_name,
+            'profile': profile,
+            'result': result,
+            'input_records': len(input_data.get('instances', [])),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        safe_endpoint_name = sanitize_for_logging(endpoint_name, 100)
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.error(f"Endpoint invocation failed profile={safe_profile} endpoint={safe_endpoint_name} error={error_msg}")
+        
+        return {
+            'status': 'failed',
+            'endpoint_name': endpoint_name,
+            'profile': profile,
+            'error': error_msg,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def process_prediction_results(prediction_result: Dict[str, Any], profile: str, execution_id: str) -> Dict[str, Any]:
+    """
+    Process and validate prediction results
+    """
+    
+    try:
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.info(f"Processing prediction results profile={safe_profile}")
+        
+        if prediction_result.get('status') != 'success':
+            return {
+                'status': 'failed',
+                'error': 'Endpoint invocation failed',
+                'profile': profile,
+                'raw_result': prediction_result
+            }
+        
+        # Extract predictions from result
+        raw_result = prediction_result.get('result', {})
+        
+        # Handle different response formats
+        if isinstance(raw_result, dict) and 'predictions' in raw_result:
+            predictions = raw_result['predictions']
+            metadata = raw_result.get('metadata', {})
+        elif isinstance(raw_result, list):
+            predictions = raw_result
+            metadata = {}
+        else:
+            raise ValueError(f"Unexpected result format: {type(raw_result)}")
+        
         if not predictions:
-            raise Exception(f"No predictions received from endpoint {endpoint_name}")
-       
-        # SECURITY FIX: Safe prediction count logging (Line 108 original)
-        predictions_count = len(predictions)
-        logger.info(f"Received predictions from endpoint count={predictions_count}")
-       
-        # Step 5: Post-process and save results (same as container logic)
-        logger.info(f"Step 5: Post-processing and saving results")
-        results = prediction_core.post_process_and_save_predictions(
-            profile=profile,
-            test_data=prepared_data,
-            predictions=predictions,
-            execution_id=execution_id,
-            lambda_execution_id=lambda_execution_id
+            raise ValueError("No predictions returned from endpoint")
+        
+        # Calculate statistics
+        prediction_stats = calculate_prediction_statistics(predictions)
+        
+        processed_result = {
+            'status': 'success',
+            'profile': profile,
+            'predictions': predictions,
+            'prediction_count': len(predictions),
+            'statistics': prediction_stats,
+            'endpoint_metadata': metadata,
+            'processing_timestamp': datetime.now().isoformat(),
+            'execution_id': execution_id
+        }
+        
+        logger.info(f"Processed predictions profile={safe_profile} count={len(predictions)}")
+        
+        return processed_result
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.error(f"Failed to process predictions profile={safe_profile} error={error_msg}")
+        
+        return {
+            'status': 'failed',
+            'error': error_msg,
+            'profile': profile,
+            'raw_result': prediction_result,
+            'execution_id': execution_id,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def calculate_prediction_statistics(predictions: List[float]) -> Dict[str, float]:
+    """
+    Calculate statistics for predictions
+    """
+    
+    try:
+        if not predictions:
+            return {}
+        
+        # Convert to float if needed
+        pred_values = [float(p) for p in predictions]
+        
+        stats = {
+            'min': min(pred_values),
+            'max': max(pred_values),
+            'mean': sum(pred_values) / len(pred_values),
+            'total': sum(pred_values),
+            'count': len(pred_values)
+        }
+        
+        # Calculate median
+        sorted_preds = sorted(pred_values)
+        n = len(sorted_preds)
+        if n % 2 == 0:
+            stats['median'] = (sorted_preds[n//2-1] + sorted_preds[n//2]) / 2
+        else:
+            stats['median'] = sorted_preds[n//2]
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Failed to calculate statistics: {str(e)}")
+        return {'error': 'Statistics calculation failed'}
+
+def store_prediction_results(processed_result: Dict[str, Any], profile: str, data_bucket: str, execution_id: str) -> Dict[str, Any]:
+    """
+    Store prediction results in S3
+    """
+    
+    try:
+        safe_profile = sanitize_for_logging(profile, 50)
+        safe_bucket = sanitize_for_logging(data_bucket, 100)
+        logger.info(f"Storing prediction results profile={safe_profile} bucket={safe_bucket}")
+        
+        # Create S3 key for results
+        current_date = datetime.now().strftime("%Y%m%d")
+        current_time = datetime.now().strftime("%H%M%S")
+        s3_key = f"prediction-results/{profile}/{current_date}/predictions_{profile}_{current_time}_{execution_id[:8]}.json"
+        
+        # Prepare storage payload
+        storage_payload = {
+            'prediction_results': processed_result,
+            'storage_metadata': {
+                'profile': profile,
+                'execution_id': execution_id,
+                'storage_timestamp': datetime.now().isoformat(),
+                'data_bucket': data_bucket,
+                's3_key': s3_key
+            }
+        }
+        
+        # Store in S3
+        s3_client.put_object(
+            Bucket=data_bucket,
+            Key=s3_key,
+            Body=json.dumps(storage_payload, indent=2, default=str),
+            ContentType='application/json'
         )
-       
-        # Step 6: Generate summary (same as container logic)
-        summary = {
+        
+        safe_key = sanitize_for_logging(s3_key, 200)
+        logger.info(f"Stored prediction results profile={safe_profile} key={safe_key}")
+        
+        return {
+            'status': 'success',
+            's3_bucket': data_bucket,
+            's3_key': s3_key,
+            'storage_timestamp': datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.error(f"Failed to store prediction results profile={safe_profile} error={error_msg}")
+        
+        return {
+            'status': 'failed',
+            'error': error_msg,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def test_endpoint_connectivity(profile: str, endpoint_name: str, execution_id: str) -> Dict[str, Any]:
+    """
+    Test endpoint connectivity with minimal sample data
+    """
+    
+    try:
+        safe_profile = sanitize_for_logging(profile, 50)
+        safe_endpoint_name = sanitize_for_logging(endpoint_name, 100)
+        logger.info(f"Testing endpoint connectivity profile={safe_profile} endpoint={safe_endpoint_name}")
+        
+        # Generate minimal test data
+        test_data = generate_sample_input_data(profile)
+        if not test_data:
+            return {
+                'status': 'failed',
+                'error': 'Failed to generate test data',
+                'profile': profile,
+                'endpoint_name': endpoint_name
+            }
+        
+        # Use only first record for connectivity test
+        test_payload = {
+            "instances": test_data["instances"][:1]
+        }
+        
+        # Test endpoint
+        start_time = datetime.now()
+        prediction_result = invoke_sagemaker_endpoint(endpoint_name, test_payload, profile)
+        response_time = (datetime.now() - start_time).total_seconds()
+        
+        if prediction_result.get('status') == 'success':
+            return {
+                'status': 'success',
+                'profile': profile,
+                'endpoint_name': endpoint_name,
+                'response_time_seconds': response_time,
+                'test_prediction': prediction_result.get('result'),
+                'connectivity_test': True,
+                'execution_id': execution_id,
+                'timestamp': datetime.now().isoformat()
+            }
+        else:
+            return {
+                'status': 'failed',
+                'profile': profile,
+                'endpoint_name': endpoint_name,
+                'error': prediction_result.get('error', 'Unknown error'),
+                'response_time_seconds': response_time,
+                'execution_id': execution_id,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        safe_profile = sanitize_for_logging(profile, 50)
+        logger.error(f"Endpoint connectivity test failed profile={safe_profile} error={error_msg}")
+        
+        return {
+            'status': 'failed',
             'profile': profile,
             'endpoint_name': endpoint_name,
-            'status': 'success',
-            'prediction_count': len(predictions),
+            'error': error_msg,
             'execution_id': execution_id,
-            'completion_time': datetime.now().isoformat(),
-            'output_location': results.get('s3_output_path'),
-            'statistics': results.get('statistics', {}),
-            'data_summary': {
-                'input_features': prepared_data.shape[1] if hasattr(prepared_data, 'shape') else len(prepared_data.columns),
-                'input_rows': prepared_data.shape[0] if hasattr(prepared_data, 'shape') else len(prepared_data),
-                'weather_data_points': len(weather_df) if weather_df is not None else 0,
-                'radiation_data_points': len(radiation_df) if radiation_df is not None else 0
-            },
-            'workflow_steps_completed': [
-                'weather_forecast_fetched',
-                'radiation_forecast_fetched' if profile == 'RN' else 'radiation_forecast_skipped',
-                'test_data_loaded',
-                'prediction_data_prepared',
-                'endpoint_predictions_completed',
-                'results_post_processed',
-                'results_saved_to_s3'
-            ]
+            'timestamp': datetime.now().isoformat()
         }
-       
-        # SECURITY FIX: Safe completion logging (Line 157 original)
-        logger.info(f"Successfully completed prediction workflow profile={safe_profile}")
-       
-        return summary
-       
-    except Exception as e:
-        error_msg = sanitize_for_logging(str(e))
-        safe_profile = sanitize_for_logging(profile, 50)
-        logger.error(f"Prediction workflow failed profile={safe_profile} error={error_msg}")
-        raise

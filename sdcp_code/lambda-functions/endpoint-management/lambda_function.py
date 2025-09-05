@@ -1,11 +1,7 @@
 """
-Enhanced Endpoint Management Lambda Function - FIXED VERSION
-This version correctly stores complete SageMaker resource creation parameters
-for proper endpoint recreation during predictions.
-
-Key Fix: The save_endpoint_configuration function now captures the actual
-SageMaker API parameters needed to recreate Model, EndpointConfig, and Endpoint
-instead of just storing metadata references.
+Enhanced Endpoint Management Lambda Function - Environment-Aware Version
+This version uses environment variables for all configuration values
+instead of hardcoded dev environment values.
 """
 
 import json
@@ -25,8 +21,8 @@ logger.setLevel(logging.INFO)
 sagemaker_client = boto3.client('sagemaker')
 s3_client = boto3.client('s3')
 
-# Configuration
-ENDPOINT_CONFIG_BUCKET = "sdcp-dev-sagemaker-energy-forecasting-data"
+# Environment-aware configuration
+ENDPOINT_CONFIG_BUCKET = os.environ.get('DATA_BUCKET')
 ENDPOINT_CONFIG_PREFIX = "endpoint-configurations/"
 EXECUTION_LOCK_PREFIX = "execution-locks/"
 
@@ -40,6 +36,10 @@ def lambda_handler(event, context):
     try:
         logger.info(f"Starting endpoint management process [{execution_id}]")
         logger.info(f"Event: {json.dumps(event, default=str)}")
+        
+        # Validate environment configuration
+        if not ENDPOINT_CONFIG_BUCKET:
+            raise ValueError("DATA_BUCKET environment variable is required but not set")
         
         # Determine operation type
         operation = event.get('operation', 'create_all_endpoints')
@@ -81,118 +81,89 @@ def handle_single_profile_endpoint(event, context, execution_id):
         
         # CRITICAL FIX: Process ONLY the single profile, not all profiles
         if not profile:
-            raise ValueError("Profile parameter is required but not found in event")
+            raise ValueError("Profile is required for single profile endpoint creation")
         
-        if profile not in approved_models:
-            raise ValueError(f"Profile '{profile}' not found in approved_models")
+        logger.info(f"Creating endpoint for profile: {profile}")
         
-        logger.info(f"Processing SINGLE profile endpoint lifecycle for: {profile}")
+        # Get model info for this specific profile
+        model_info = approved_models.get(profile)
+        if not model_info:
+            raise ValueError(f"No approved model found for profile {profile}")
         
-        # Get model info for THIS specific profile only
-        model_info = approved_models[profile]
+        # Create endpoint for this single profile
+        result = create_endpoint_lifecycle(profile, model_info, training_metadata, execution_id)
         
-        # Extract the model_info from the approved_models structure
-        profile_model_info = {
-            'model_package_arn': model_info.get('model_package_arn'),
-            'status': model_info.get('status'),
-            'approval_status': model_info.get('approval_status'),
-            'model_package_group': model_info.get('model_package_group'),
-            'registration_time': model_info.get('registration_time'),
-            'model_metadata': model_info.get('model_metadata', {})
+        return {
+            'statusCode': 200,
+            'body': result
         }
         
-        # Process ONLY this single profile
-        result = process_profile_endpoint_lifecycle(profile, profile_model_info, training_metadata, execution_id)
-        
-        if result.get('status') == 'success':
-            logger.info(f"✓ {profile} endpoint lifecycle completed successfully")
-            return {
-                'statusCode': 200,
-                'body': result
-            }
-        else:
-            logger.error(f"✗ {profile} endpoint lifecycle failed: {result.get('error')}")
-            return {
-                'statusCode': 500,
-                'body': result
-            }
-        
     except Exception as e:
-        logger.error(f"Single profile endpoint creation failed: {str(e)}")
+        logger.error(f"Single profile endpoint creation failed [{execution_id}]: {str(e)}")
         return {
             'statusCode': 500,
             'body': {
                 'error': str(e),
                 'execution_id': execution_id,
                 'profile': event.get('profile'),
-                'message': 'Single profile endpoint creation failed',
-                'event_received': str(event)  # For debugging
+                'message': 'Single profile endpoint creation failed'
             }
         }
 
 def handle_batch_endpoints(event, context, execution_id):
     """
-    Handle batch endpoint creation (backward compatibility with your original logic)
+    Handle batch endpoint operations
     """
     
     try:
-        logger.info(f"Processing batch endpoint creation for multiple profiles")
+        logger.info(f"Processing batch endpoint operations")
         
-        # Extract batch information
-        approved_models = event.get('approved_models', {})
+        # Extract information from event
         training_metadata = event.get('training_metadata', {})
+        approved_models = event.get('approved_models', {})
         
         if not approved_models:
-            raise ValueError("No approved_models provided for batch endpoint creation")
+            raise ValueError("No approved models provided for endpoint creation")
         
-        # Process each profile (THIS is where we loop through all profiles)
-        results = {}
-        successful_profiles = 0
+        logger.info(f"Creating endpoints for {len(approved_models)} profiles")
+        
+        # Create endpoints for all approved models
+        endpoint_results = {}
+        successful_endpoints = 0
         
         for profile, model_info in approved_models.items():
             try:
-                logger.info(f"Processing batch endpoint for profile: {profile}")
+                logger.info(f"Creating endpoint for profile: {profile}")
                 
-                # Extract the model_info from the approved_models structure
-                profile_model_info = {
-                    'model_package_arn': model_info.get('model_package_arn'),
-                    'status': model_info.get('status'),
-                    'approval_status': model_info.get('approval_status'),
-                    'model_package_group': model_info.get('model_package_group'),
-                    'registration_time': model_info.get('registration_time'),
-                    'model_metadata': model_info.get('model_metadata', {})
-                }
-                
-                result = process_profile_endpoint_lifecycle(profile, profile_model_info, training_metadata, execution_id)
-                results[profile] = result
+                result = create_endpoint_lifecycle(profile, model_info, training_metadata, execution_id)
+                endpoint_results[profile] = result
                 
                 if result.get('status') == 'success':
-                    successful_profiles += 1
-                    logger.info(f"✓ {profile} endpoint lifecycle completed successfully")
-                else:
-                    logger.error(f"✗ {profile} endpoint lifecycle failed: {result.get('error')}")
-                    
+                    successful_endpoints += 1
+                
             except Exception as e:
-                logger.error(f"✗ Profile {profile} failed: {str(e)}")
-                results[profile] = {
+                logger.error(f"Failed to create endpoint for {profile}: {str(e)}")
+                endpoint_results[profile] = {
                     'status': 'failed',
                     'error': str(e),
                     'profile': profile
                 }
         
+        # Return comprehensive results
         return {
             'statusCode': 200,
             'body': {
-                'message': f'Batch endpoint creation completed: {successful_profiles}/{len(approved_models)} successful',
-                'successful_profiles': successful_profiles,
+                'operation': 'batch_endpoint_creation',
+                'execution_id': execution_id,
                 'total_profiles': len(approved_models),
-                'detailed_results': results,
-                'execution_id': execution_id
+                'successful_endpoints': successful_endpoints,
+                'endpoint_results': endpoint_results,
+                'timestamp': datetime.now().isoformat()
             }
         }
         
     except Exception as e:
-        logger.error(f"Batch endpoint creation failed: {str(e)}")
+        logger.error(f"Batch endpoint creation failed [{execution_id}]: {str(e)}")
         return {
             'statusCode': 500,
             'body': {
@@ -202,77 +173,17 @@ def handle_batch_endpoints(event, context, execution_id):
             }
         }
 
-def handle_batch_endpoints(event, context, execution_id):
+def create_endpoint_lifecycle(profile: str, model_info: Dict[str, Any], training_metadata: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
     """
-    Handle batch endpoint creation (backward compatibility with your original logic)
+    Complete endpoint lifecycle: create -> test -> save config -> delete
     """
-    
-    try:
-        logger.info(f"Processing batch endpoint creation for multiple profiles")
-        
-        # Extract batch information
-        approved_models = event.get('approved_models', {})
-        training_metadata = event.get('training_metadata', {})
-        
-        if not approved_models:
-            raise ValueError("No approved models provided for batch endpoint creation")
-        
-        # Process each profile
-        results = {}
-        successful_profiles = 0
-        
-        for profile, model_info in approved_models.items():
-            try:
-                logger.info(f"Processing batch endpoint for profile: {profile}")
-                
-                result = process_profile_endpoint_lifecycle(profile, model_info, training_metadata, execution_id)
-                results[profile] = result
-                
-                if result.get('status') == 'success':
-                    successful_profiles += 1
-                    logger.info(f"✓ {profile} endpoint lifecycle completed successfully")
-                else:
-                    logger.error(f"✗ {profile} endpoint lifecycle failed: {result.get('error')}")
-                    
-            except Exception as e:
-                logger.error(f"✗ Profile {profile} failed: {str(e)}")
-                results[profile] = {
-                    'status': 'failed',
-                    'error': str(e),
-                    'profile': profile
-                }
-        
-        return {
-            'statusCode': 200,
-            'body': {
-                'message': f'Batch endpoint creation completed: {successful_profiles}/{len(approved_models)} successful',
-                'successful_profiles': successful_profiles,
-                'total_profiles': len(approved_models),
-                'detailed_results': results,
-                'execution_id': execution_id
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Batch endpoint creation failed: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': {
-                'error': str(e),
-                'execution_id': execution_id,
-                'message': 'Batch endpoint creation failed'
-            }
-        }
-
-def process_profile_endpoint_lifecycle(profile: str, model_info: Dict[str, Any], 
-                                     training_metadata: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
-    """Process complete endpoint lifecycle for a single profile"""
     
     result = {
         'profile': profile,
-        'status': 'failed',
+        'status': 'in_progress',
+        'steps_completed': [],
         'execution_id': execution_id,
-        'steps_completed': []
+        'timestamp': datetime.now().isoformat()
     }
     
     endpoint_name = None
@@ -280,50 +191,39 @@ def process_profile_endpoint_lifecycle(profile: str, model_info: Dict[str, Any],
     model_name = None
     
     try:
-        # Step 1: Create model
-        logger.info(f"Step 1: Creating Model for {profile}")
+        logger.info(f"Starting endpoint lifecycle for {profile}")
+        
+        # Step 1: Create SageMaker model
+        logger.info(f"Step 1: Creating SageMaker model")
         model_name = create_model_for_profile(profile, model_info, execution_id)
-        
-        if not model_name:
-            result['error'] = "Failed to create model"
-            return result
-        
         result['model_name'] = model_name
         result['steps_completed'].append('model_created')
         logger.info(f"Created model: {model_name}")
         
         # Step 2: Create endpoint configuration
-        logger.info(f"Step 2: Creating Endpoint Configuration for {profile}")
-        endpoint_config_name = create_endpoint_config_for_profile(profile, model_name, execution_id)
-        
-        if not endpoint_config_name:
-            result['error'] = "Failed to create endpoint configuration"
-            return result
-        
+        logger.info(f"Step 2: Creating endpoint configuration")
+        endpoint_config_name = create_endpoint_config(profile, model_name, execution_id)
         result['endpoint_config_name'] = endpoint_config_name
         result['steps_completed'].append('endpoint_config_created')
-        logger.info(f"Created endpoint configuration: {endpoint_config_name}")
+        logger.info(f"Created endpoint config: {endpoint_config_name}")
         
-        # Step 3: Create Endpoint
-        logger.info(f"Step 3: Creating Endpoint for {profile}")
+        # Step 3: Create endpoint
+        logger.info(f"Step 3: Creating endpoint")
         endpoint_name = create_endpoint(profile, endpoint_config_name, execution_id)
-        
-        if not endpoint_name:
-            result['error'] = "Failed to create endpoint"
-            return result
-        
         result['endpoint_name'] = endpoint_name
         result['steps_completed'].append('endpoint_created')
         logger.info(f"Created endpoint: {endpoint_name}")
         
-        # Step 4: Wait for endpoint to be InService
-        logger.info(f"Step 4: Waiting for endpoint to be InService")
-        if not wait_for_endpoint_inservice(endpoint_name, timeout_minutes=15):
-            result['error'] = "Endpoint failed to reach InService status"
+        # Step 4: Wait for endpoint to be ready
+        logger.info(f"Step 4: Waiting for endpoint to be ready")
+        ready_success = wait_for_endpoint_ready(endpoint_name, max_wait_time=600)
+        
+        if not ready_success:
+            result['error'] = "Endpoint did not become ready within timeout"
             return result
         
-        result['steps_completed'].append('endpoint_inservice')
-        logger.info(f"Endpoint {endpoint_name} is InService")
+        result['steps_completed'].append('endpoint_ready')
+        logger.info(f"Endpoint is ready")
         
         # Step 5: Test endpoint
         logger.info(f"Step 5: Testing endpoint inference")
@@ -382,130 +282,88 @@ def process_profile_endpoint_lifecycle(profile: str, model_info: Dict[str, Any],
 def create_model_for_profile(profile: str, model_info: Dict[str, Any], execution_id: str) -> str:
     """Create SageMaker model for a specific profile"""
     
-    try:
-        # Generate unique model name
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        model_name = f"energy-forecasting-{profile.lower()}-model-{timestamp}-{execution_id[:8]}"
-        
-        # Get execution role
-        role_arn = get_sagemaker_execution_role()
-        
-        # Get model package details from Model Registry
-        model_package_arn = model_info.get('model_package_arn')
-        if not model_package_arn:
-            raise ValueError(f"No model package ARN found for profile {profile}")
-        
-        # Create model from Model Registry package
-        sagemaker_client.create_model(
-            ModelName=model_name,
-            Containers=[
-                {
-                    'ModelPackageName': model_package_arn
-                }
-            ],
-            ExecutionRoleArn=role_arn,
-            Tags=[
-                {'Key': 'Profile', 'Value': profile},
-                {'Key': 'Purpose', 'Value': 'EnergyForecasting'},
-                {'Key': 'CreatedBy', 'Value': 'EndpointManagementLambda'},
-                {'Key': 'ExecutionId', 'Value': execution_id}
-            ]
-        )
-        
-        logger.info(f"Successfully created model: {model_name}")
-        return model_name
-        
-    except Exception as e:
-        logger.error(f"Failed to create model for {profile}: {str(e)}")
-        return None
-
-def create_endpoint_config_for_profile(profile: str, model_name: str, execution_id: str) -> str:
-    """Create endpoint configuration for a specific profile"""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    model_name = f"energy-forecasting-{profile.lower()}-model-{timestamp}-{execution_id[:8]}"
     
-    try:
-        # Generate unique endpoint config name
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        endpoint_config_name = f"energy-forecasting-{profile.lower()}-config-{timestamp}-{execution_id[:8]}"
-        
-        # Create endpoint configuration
-        sagemaker_client.create_endpoint_config(
-            EndpointConfigName=endpoint_config_name,
-            ProductionVariants=[
-                {
-                    'VariantName': 'AllTraffic',
-                    'ModelName': model_name,
-                    'InitialInstanceCount': 1,
-                    'InstanceType': 'ml.m5.large',
-                    'InitialVariantWeight': 1.0
-                }
-            ],
-            Tags=[
-                {'Key': 'Profile', 'Value': profile},
-                {'Key': 'Purpose', 'Value': 'EnergyForecasting'},
-                {'Key': 'CreatedBy', 'Value': 'EndpointManagementLambda'},
-                {'Key': 'ExecutionId', 'Value': execution_id}
-            ]
-        )
-        
-        logger.info(f"Successfully created endpoint configuration: {endpoint_config_name}")
-        return endpoint_config_name
-        
-    except Exception as e:
-        logger.error(f"Failed to create endpoint configuration for {profile}: {str(e)}")
-        return None
+    # Extract model package ARN from model_info
+    model_package_arn = model_info.get('model_package_arn')
+    if not model_package_arn:
+        raise ValueError(f"No model package ARN found for profile {profile}")
+    
+    # Get SageMaker execution role from environment
+    sagemaker_role = os.environ.get('SAGEMAKER_EXECUTION_ROLE')
+    if not sagemaker_role:
+        raise ValueError("SAGEMAKER_EXECUTION_ROLE environment variable is required")
+    
+    # Create model from model package
+    sagemaker_client.create_model(
+        ModelName=model_name,
+        Containers=[
+            {
+                'ModelPackageName': model_package_arn
+            }
+        ],
+        ExecutionRoleArn=sagemaker_role
+    )
+    
+    return model_name
+
+def create_endpoint_config(profile: str, model_name: str, execution_id: str) -> str:
+    """Create endpoint configuration"""
+    
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    config_name = f"energy-forecasting-{profile.lower()}-config-{timestamp}-{execution_id[:8]}"
+    
+    sagemaker_client.create_endpoint_config(
+        EndpointConfigName=config_name,
+        ProductionVariants=[
+            {
+                'VariantName': 'primary',
+                'ModelName': model_name,
+                'InitialInstanceCount': 1,
+                'InstanceType': 'ml.t2.medium',
+                'InitialVariantWeight': 1.0
+            }
+        ]
+    )
+    
+    return config_name
 
 def create_endpoint(profile: str, endpoint_config_name: str, execution_id: str) -> str:
     """Create SageMaker endpoint"""
     
-    try:
-        # Generate unique endpoint name
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        endpoint_name = f"energy-forecasting-{profile.lower()}-endpoint-{timestamp}-{execution_id[:8]}"
-        
-        # Create endpoint
-        sagemaker_client.create_endpoint(
-            EndpointName=endpoint_name,
-            EndpointConfigName=endpoint_config_name,
-            Tags=[
-                {'Key': 'Profile', 'Value': profile},
-                {'Key': 'Purpose', 'Value': 'EnergyForecasting'},
-                {'Key': 'CreatedBy', 'Value': 'EndpointManagementLambda'},
-                {'Key': 'ExecutionId', 'Value': execution_id}
-            ]
-        )
-        
-        logger.info(f"Successfully created endpoint: {endpoint_name}")
-        return endpoint_name
-        
-    except Exception as e:
-        logger.error(f"Failed to create endpoint for {profile}: {str(e)}")
-        return None
-
-def wait_for_endpoint_inservice(endpoint_name: str, timeout_minutes: int = 15) -> bool:
-    """Wait for endpoint to reach InService status"""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    endpoint_name = f"energy-forecasting-{profile.lower()}-endpoint-{timestamp}-{execution_id[:8]}"
     
-    timeout_seconds = timeout_minutes * 60
+    sagemaker_client.create_endpoint(
+        EndpointName=endpoint_name,
+        EndpointConfigName=endpoint_config_name
+    )
+    
+    return endpoint_name
+
+def wait_for_endpoint_ready(endpoint_name: str, max_wait_time: int = 600) -> bool:
+    """Wait for endpoint to be ready"""
+    
     start_time = time.time()
     
-    while time.time() - start_time < timeout_seconds:
+    while time.time() - start_time < max_wait_time:
         try:
             response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
             status = response['EndpointStatus']
             
-            logger.info(f"Endpoint {endpoint_name} status: {status}")
-            
             if status == 'InService':
+                logger.info(f"Endpoint {endpoint_name} is ready")
                 return True
-            elif status == 'Failed':
-                failure_reason = response.get('FailureReason', 'Unknown error')
-                logger.error(f"Endpoint {endpoint_name} failed: {failure_reason}")
+            elif status in ['Failed', 'RollingBack']:
+                logger.error(f"Endpoint {endpoint_name} failed with status: {status}")
                 return False
             
-            # Wait before checking again
+            logger.info(f"Endpoint {endpoint_name} status: {status}, waiting...")
             time.sleep(30)
             
         except Exception as e:
-            logger.warning(f"Error checking endpoint status: {str(e)}")
+            logger.error(f"Error checking endpoint status: {str(e)}")
             time.sleep(30)
     
     logger.error(f"Timeout waiting for endpoint {endpoint_name} to be ready")
@@ -571,130 +429,70 @@ def save_complete_endpoint_configuration(endpoint_name: str, endpoint_config_nam
         model_response = sagemaker_client.describe_model(ModelName=model_name)
         endpoint_response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
         
-        # 2. FIXED: Get ACTUAL container details from the Model Package
-        model_package_arn = model_info.get('model_package_arn') or model_info.get('ModelPackageArn')
-        
-        if not model_package_arn:
-            raise ValueError(f"No model_package_arn found in model_info for {profile}")
-        
-        # Get the Model Package details to extract actual container information
-        logger.info(f"Fetching Model Package details from: {model_package_arn}")
-        model_package_response = sagemaker_client.describe_model_package(ModelPackageName=model_package_arn)
-        
-        # Extract ACTUAL container details from Model Package
-        if 'InferenceSpecification' in model_package_response:
-            inference_spec = model_package_response['InferenceSpecification']
+        # 2. Get ACTUAL container details from the model package
+        model_package_arn = model_info.get('model_package_arn')
+        if model_package_arn:
+            model_package_response = sagemaker_client.describe_model_package(ModelPackageName=model_package_arn)
+            inference_spec = model_package_response.get('InferenceSpecification', {})
             containers = inference_spec.get('Containers', [])
-            logger.info(f"Containers: {containers}")
             
-            if containers and len(containers) > 0:
-                # Use the first container (primary container)
-                primary_container_spec = containers[0]
-                
-                # Extract ACTUAL values
-                actual_image = primary_container_spec.get('Image', 'UNKNOWN_IMAGE')
-                actual_model_data_url = primary_container_spec.get('ModelDataUrl', 'UNKNOWN_MODEL_DATA_URL')
-                container_environment = primary_container_spec.get('Environment', {})
-                
-                # Combine with standard SageMaker environment variables
-                complete_environment = {
-                    "SAGEMAKER_CONTAINER_LOG_LEVEL": "20",
-                    "SAGEMAKER_MODEL_SERVER_WORKERS": "1",
-                    "SAGEMAKER_PROGRAM": "inference.py",
-                    "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model",
-                    **container_environment  # Add any Model Package specific environment variables
-                }
-                
-                # Create the model config with ACTUAL values
-                model_config = {
-                    "execution_role_arn": model_response['ExecutionRoleArn'],
-                    "primary_container": {
-                        "Image": actual_image,
-                        "Mode": "SingleModel",
-                        "ModelDataUrl": actual_model_data_url,
-                        "ModelDataSource": {
-                            "S3DataSource": {
-                                "S3Uri": actual_model_data_url,
-                                "S3DataType": "S3Object",
-                                "CompressionType": "Gzip"
-                            }
-                        },
-                        "Environment": complete_environment
-                    },
-                    "model_package_name": model_package_arn,
-                    "tags": []
-                }
-                
-                logger.info(f"Successfully extracted actual container details:")
-                logger.info(f"  Image: {actual_image}")
-                logger.info(f"  ModelDataUrl: {actual_model_data_url}")
-                logger.info(f"  Environment vars: {len(complete_environment)}")
-                
+            # Extract the ACTUAL image and model data URL
+            if containers:
+                actual_image = containers[0].get('Image', 'unknown')
+                actual_model_data_url = containers[0].get('ModelDataUrl', 'unknown')
             else:
-                raise ValueError(f"No containers found in Model Package InferenceSpecification for {profile}")
+                actual_image = 'unknown'
+                actual_model_data_url = 'unknown'
         else:
-            raise ValueError(f"No InferenceSpecification found in Model Package for {profile}")
+            actual_image = 'unknown'
+            actual_model_data_url = 'unknown'
         
-        # 3. Generate current timestamp
-        current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 4. Create configuration in YOUR PROVEN WORKING FORMAT with ACTUAL values
+        # 3. Create COMPLETE configuration data with ACTUAL container details
         complete_config_data = {
-            # Basic identification (matching your format)
-            "endpoint_name": endpoint_name,
-            "model_name": model_name,
-            "endpoint_config_name": endpoint_config_name,
-            "model_package_arn": model_package_arn,
-            "run_id": f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            "instance_type": endpoint_config_response['ProductionVariants'][0]['InstanceType'],
-            "instance_count": endpoint_config_response['ProductionVariants'][0]['InitialInstanceCount'],
-            "environment": "dev",
-            "customer_profile": profile,
-            "customer_segment": "FORECASTING",
-            "cost_optimized": True,
-            "delete_recreate_enabled": True,
-            "created_at": current_timestamp,
+            # Metadata
+            'profile': profile,
+            'creation_timestamp': datetime.now().isoformat(),
+            'training_metadata': training_metadata,
+            'execution_id': endpoint_name.split('-')[-2:],  # Extract from endpoint name
             
-            # Endpoint configuration (matching your format exactly)
-            "endpoint_config": {
-                "production_variants": [
+            # ACTUAL SageMaker API parameters for recreation
+            'model_config': {
+                'ModelName': model_name,  # This will be generated fresh during recreation
+                'Containers': [
                     {
-                        "VariantName": variant['VariantName'],
-                        "ModelName": variant['ModelName'],  # Will be replaced during recreation
-                        "InitialInstanceCount": variant['InitialInstanceCount'],
-                        "InstanceType": variant['InstanceType'],
-                        "InitialVariantWeight": variant['InitialVariantWeight']
-                    } for variant in endpoint_config_response['ProductionVariants']
+                        'Image': actual_image,
+                        'ModelDataUrl': actual_model_data_url,
+                        'Environment': containers[0].get('Environment', {}) if containers else {}
+                    }
                 ],
-                "tags": []
+                'ExecutionRoleArn': model_response['ExecutionRoleArn']
             },
             
-            # Model configuration with ACTUAL values (matching your format exactly)
-            "model_config": model_config,
-            
-            # Recreation notes (matching your format)
-            "recreation_notes": {
-                "approach": "delete_recreate",
-                "cost_optimization": "endpoint_deleted_after_deployment_and_predictions", 
-                "recreation_method": "lambda_function_recreates_from_this_config",
-                "estimated_startup_time": "3-5_minutes",
-                "container_details_source": "model_package_inference_specification"
+            'endpoint_config': {
+                'EndpointConfigName': endpoint_config_name,  # This will be generated fresh
+                'ProductionVariants': endpoint_config_response['ProductionVariants']
             },
             
-            # Additional metadata for our pipeline
-            "training_metadata": training_metadata,
-            "model_info": model_info,
-            "model_package_details": {
-                "model_package_arn": model_package_arn,
-                "model_package_status": model_package_response.get('ModelPackageStatus', 'UNKNOWN'),
-                "creation_time": model_package_response.get('CreationTime', '').isoformat() if model_package_response.get('CreationTime') else None
+            'endpoint_config_details': {
+                'EndpointName': endpoint_name,  # This will be generated fresh
+                'EndpointConfigName': endpoint_config_name
             },
-            "creation_timestamp": datetime.now().isoformat(),
-            "created_by": "training-pipeline-enhanced",
-            "configuration_version": "4.0_actual_container_details"
+            
+            # Original model package information
+            'model_package_info': {
+                'model_package_arn': model_package_arn,
+                'original_model_info': model_info
+            },
+            
+            # Validation information
+            'validation_info': {
+                'endpoint_tested': True,
+                'configuration_version': '4.0_actual_container_details',
+                'format_source': 'model_package_inference_specification'
+            }
         }
         
-        # 5. Save to S3 with profile-specific folder structure
+        # Save to S3 with profile-specific folder structure
         current_date = datetime.now().strftime("%Y%m%d")
         s3_key = f"{ENDPOINT_CONFIG_PREFIX}{profile}/{profile}_endpoint_config_{current_date}.json"
         
@@ -759,28 +557,12 @@ def delete_endpoint_and_resources(endpoint_name: str, endpoint_config_name: str 
             except Exception as e:
                 logger.warning(f"Failed to delete model {model_name}: {str(e)}")
         
-        logger.info(f"Deletion completed: {deletion_results}")
-        return True
-        
+        if deletion_results:
+            logger.info(f"Deletion summary: {', '.join(deletion_results)}")
+            return True
+        else:
+            return False
+            
     except Exception as e:
-        logger.error(f"Error during resource cleanup: {str(e)}")
+        logger.error(f"Error during resource deletion: {str(e)}")
         return False
-
-def get_sagemaker_execution_role() -> str:
-    """Get SageMaker execution role ARN"""
-    
-    try:
-        # Try to get from environment variable first
-        role_arn = os.environ.get('SAGEMAKER_EXECUTION_ROLE')
-        
-        if not role_arn:
-            # Construct default role ARN
-            account_id = boto3.client('sts').get_caller_identity()['Account']
-            role_arn = f"arn:aws:iam::{account_id}:role/sdcp-dev-sagemaker-energy-forecasting-datascientist-role"
-        
-        logger.info(f"Using SageMaker execution role: {role_arn}")
-        return role_arn
-        
-    except Exception as e:
-        logger.error(f"Failed to get SageMaker execution role: {str(e)}")
-        raise

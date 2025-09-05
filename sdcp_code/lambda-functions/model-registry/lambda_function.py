@@ -1,19 +1,17 @@
 """
-Enhanced Model Registry Lambda Function
-Integrates with Step Functions pipeline and handles automatic model registration
-Based on existing working version with Step Functions integration enhancements
-SECURITY FIX: Log injection vulnerability (CWE-117, CWE-93) patched
+Enhanced Model Registry Lambda Function - Environment-Aware Version
+This version uses environment variables for all configuration values
+instead of hardcoded dev environment fallback values.
 """
 
 import json
 import boto3
 import logging
-import tempfile
-import tarfile
-import os
-import re
+import time
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, List, Any, Optional
+import uuid
+import os
 
 # Setup logging
 logger = logging.getLogger()
@@ -23,62 +21,34 @@ logger.setLevel(logging.INFO)
 sagemaker_client = boto3.client('sagemaker')
 s3_client = boto3.client('s3')
 
-# Security: Input sanitization patterns
-LOG_SANITIZER = {
-    'newlines': re.compile(r'[\r\n]+'),
-    'tabs': re.compile(r'[\t]+'),
-    'control_chars': re.compile(r'[\x00-\x1f\x7f-\x9f]'),
-    'excessive_whitespace': re.compile(r'\s{3,}')
-}
+def sanitize_for_logging(value: str, max_length: int = 50) -> str:
+    """Sanitize string values for safe logging"""
+    if not isinstance(value, str):
+        value = str(value)
+    # Remove potentially sensitive characters and limit length
+    sanitized = ''.join(c for c in value if c.isalnum() or c in '-_.')[:max_length]
+    return sanitized if sanitized else 'unknown'
 
-def sanitize_for_logging(value, max_length=500):
-    """
-    Sanitize input for safe logging to prevent log injection
-   
-    Args:
-        value: Input value to sanitize
-        max_length: Maximum allowed length for logged values
-   
-    Returns:
-        Sanitized string safe for logging
-    """
-    if value is None:
-        return "None"
-   
-    str_value = str(value)
-   
-    # Truncate if too long
-    if len(str_value) > max_length:
-        str_value = str_value[:max_length] + "...[truncated]"
-   
-    # Remove dangerous characters
-    str_value = LOG_SANITIZER['newlines'].sub(' ', str_value)
-    str_value = LOG_SANITIZER['tabs'].sub(' ', str_value)
-    str_value = LOG_SANITIZER['control_chars'].sub('', str_value)
-    str_value = LOG_SANITIZER['excessive_whitespace'].sub(' ', str_value)
-   
-    return str_value.strip()
-
-def sanitize_event_for_logging(event):
-    """Create a sanitized version of event for safe logging"""
+def sanitize_event_for_logging(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize event data for logging"""
     sanitized_event = {}
-   
-    safe_fields = ['training_date', 'model_bucket', 'data_bucket']
-   
-    for field in safe_fields:
-        if field in event:
-            sanitized_event[field] = sanitize_for_logging(event[field])
-   
-    # Handle training metadata safely
+    
+    # Safe keys to include
+    safe_keys = ['operation', 'training_date', 'region', 'account_id']
+    for key in safe_keys:
+        if key in event:
+            sanitized_event[key] = sanitize_for_logging(str(event[key]), 100)
+    
+    # Include metadata about training_metadata without exposing content
     if 'training_metadata' in event and isinstance(event['training_metadata'], dict):
         sanitized_event['training_metadata_keys'] = list(event['training_metadata'].keys())[:10]  # Max 10 keys
-   
+    
     sanitized_event['_metadata'] = {
         'event_keys_count': len(event.keys()),
         'has_training_metadata': 'training_metadata' in event,
         'has_buckets': bool(event.get('model_bucket') or event.get('data_bucket'))
     }
-   
+    
     return sanitized_event
 
 def lambda_handler(event, context):
@@ -86,22 +56,30 @@ def lambda_handler(event, context):
     Enhanced Lambda handler for model registry with Step Functions integration
     Handles both direct invocation and Step Functions pipeline integration
     """
-   
+    
     execution_id = context.aws_request_id
-   
+    
     try:
         logger.info(f"Starting enhanced model registry process [execution_id={sanitize_for_logging(execution_id)}]")
-       
+        
         # SECURITY FIX: Sanitize event data before logging
         sanitized_event = sanitize_event_for_logging(event)
         logger.info(f"Event metadata: {json.dumps(sanitized_event)}")
-       
+        
         # Extract information from event (supports both formats)
         training_metadata = event.get('training_metadata', {})
         training_date = event.get('training_date', datetime.now().strftime('%Y%m%d'))
-        model_bucket = event.get('model_bucket', os.environ.get('MODEL_BUCKET', 'sdcp-dev-sagemaker-energy-forecasting-models'))
-        data_bucket = event.get('data_bucket', os.environ.get('DATA_BUCKET', 'sdcp-dev-sagemaker-energy-forecasting-data'))
-       
+        
+        # Environment-aware bucket configuration - no hardcoded fallbacks
+        model_bucket = event.get('model_bucket') or os.environ.get('MODEL_BUCKET')
+        data_bucket = event.get('data_bucket') or os.environ.get('DATA_BUCKET')
+        
+        # Validate required environment variables
+        if not model_bucket:
+            raise ValueError("MODEL_BUCKET must be provided in event or environment variables")
+        if not data_bucket:
+            raise ValueError("DATA_BUCKET must be provided in event or environment variables")
+        
         # Enhanced configuration
         config = {
             "model_bucket": model_bucket,
@@ -113,524 +91,511 @@ def lambda_handler(event, context):
             "region": os.environ.get('REGION', 'us-west-2'),
             "account_id": os.environ.get('ACCOUNT_ID', context.invoked_function_arn.split(':')[4])
         }
-       
+        
         # SECURITY FIX: Sanitize config values for logging
         safe_training_date = sanitize_for_logging(training_date, 20)
         safe_model_bucket = sanitize_for_logging(config["model_bucket"], 100)
         safe_data_bucket = sanitize_for_logging(config["data_bucket"], 100)
-       
-        logger.info(f"Processing models training_date={safe_training_date} model_bucket={safe_model_bucket} data_bucket={safe_data_bucket}")
-       
-        # Step 1: Find latest models for each profile
-        latest_models = find_latest_models(config, training_date)
-       
-        if not latest_models:
-            # Check if this is expected (e.g., no new training)
-            logger.warning("No models found for registration - checking if this is expected")
-            return {
-                'statusCode': 200,
-                'body': {
-                    'message': 'No models found for registration',
-                    'execution_id': execution_id,
-                    'successful_count': 0,
-                    'total_models': 0,
-                    'approved_models': {},
-                    'training_metadata': training_metadata,
-                    'training_date': training_date,
-                    'timestamp': datetime.now().isoformat(),
-                    'status': 'no_models_found'
-                }
-            }
-       
-        models_found_count = len(latest_models)
-        logger.info(f"Found models for registration count={models_found_count}")
-       
-        # Step 2: Create model package groups
-        registry_groups = create_model_package_groups(config['profiles'], config['customer_profile'])
-       
-        # Step 3: Process each model
-        approved_models = {}
-        successful_count = 0
-        processing_results = {}
-       
-        for profile, model_info in latest_models.items():
-            try:
-                # SECURITY FIX: Sanitize profile name for logging
-                safe_profile = sanitize_for_logging(profile, 50)
-                logger.info(f"Processing model profile={safe_profile}")
-               
-                # Package and register model
-                result = process_single_model(
-                    profile=profile,
-                    model_info=model_info,
-                    config=config,
-                    registry_group=registry_groups.get(profile),
-                    execution_id=execution_id
-                )
-               
-                processing_results[profile] = result
-               
-                if result['status'] == 'success':
-                    approved_models[profile] = result
-                    successful_count += 1
-                    logger.info(f"Successfully processed model profile={safe_profile}")
-                else:
-                    error_msg = sanitize_for_logging(result.get('error', 'Unknown error'))
-                    logger.error(f"Failed to process model profile={safe_profile} error={error_msg}")
-                   
-            except Exception as e:
-                error_msg = sanitize_for_logging(str(e))
-                safe_profile = sanitize_for_logging(profile, 50)
-                logger.error(f"Exception processing profile={safe_profile} error={error_msg}")
-                processing_results[profile] = {
-                    'status': 'failed',
-                    'error': error_msg,
-                    'profile': profile
-                }
-                continue
-       
-        # Step 4: Generate summary and metrics
-        summary_metrics = generate_processing_summary(
-            latest_models, processing_results, successful_count, execution_id
-        )
-       
-        # Prepare enhanced response for Step Functions
-        response = {
+        
+        logger.info(f"Configuration: training_date={safe_training_date} model_bucket={safe_model_bucket} data_bucket={safe_data_bucket}")
+        
+        # Execute model registry workflow
+        registry_result = execute_enhanced_model_registry_workflow(config, training_metadata, execution_id)
+        
+        # Return Step Functions compatible response
+        return {
             'statusCode': 200,
-            'body': {
-                'message': f'Enhanced model registry completed for {len(latest_models)} models',
-                'execution_id': execution_id,
-                'successful_count': successful_count,
-                'failed_count': len(latest_models) - successful_count,
-                'total_models': len(latest_models),
-                'success_rate': (successful_count / len(latest_models)) * 100 if latest_models else 0,
-                'approved_models': approved_models,
-                'processing_results': processing_results,
-                'training_metadata': training_metadata,
-                'training_date': training_date,
-                'timestamp': datetime.now().isoformat(),
-                'config': config,
-                'summary_metrics': summary_metrics,
-                'next_step_ready': successful_count > 0
-            }
+            'body': registry_result
         }
-       
-        logger.info(f"Enhanced model registry process completed [execution_id={sanitize_for_logging(execution_id)}] successful={successful_count} total={len(latest_models)}")
-        return response
-       
+        
     except Exception as e:
-        error_msg = sanitize_for_logging(str(e))
-        logger.error(f"Enhanced model registry process failed [execution_id={sanitize_for_logging(execution_id)}] error={error_msg}")
+        error_message = sanitize_for_logging(str(e), 200)
+        logger.error(f"Enhanced model registry process failed [execution_id={sanitize_for_logging(execution_id)}]: {error_message}")
+        
         return {
             'statusCode': 500,
             'body': {
-                'error': error_msg,
+                'error': error_message,
                 'execution_id': execution_id,
                 'message': 'Enhanced model registry process failed',
-                'timestamp': datetime.now().isoformat(),
-                'next_step_ready': False
+                'timestamp': datetime.now().isoformat()
             }
         }
 
-def find_latest_models(config: Dict[str, Any], training_date: str = None) -> Dict[str, Dict]:
+def execute_enhanced_model_registry_workflow(config: Dict[str, Any], training_metadata: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
     """
-    Enhanced model discovery with better pattern matching and date handling
+    Execute the complete enhanced model registry workflow
     """
-    latest_models = {}
-   
+    
     try:
-        # SECURITY FIX: Sanitize bucket and prefix for logging
-        safe_bucket = sanitize_for_logging(config["model_bucket"], 100)
-        safe_prefix = sanitize_for_logging(config["model_prefix"], 50)
-        logger.info(f"Searching for models bucket={safe_bucket} prefix={safe_prefix}")
-       
-        response = s3_client.list_objects_v2(
-            Bucket=config["model_bucket"],
-            Prefix=config["model_prefix"]
-        )
-       
-        if 'Contents' not in response:
-            logger.warning(f"No objects found in S3 bucket={safe_bucket} prefix={safe_prefix}")
-            return {}
-       
-        objects_count = len(response['Contents'])
-        logger.info(f"Found S3 objects count={objects_count}")
-       
-        # Parse model files by profile with enhanced pattern matching
-        profile_models = {profile: [] for profile in config["profiles"]}
-       
-        for obj in response['Contents']:
-            key = obj['Key']
-            filename = os.path.basename(key)
-           
-            # Enhanced pattern matching for different naming conventions
-            patterns = [
-                r'(?:df_)?([A-Z0-9]+)_best_xgboost_(\d{8})\.pkl',  # Current pattern
-                r'([A-Z0-9]+)_best_xgboost_(\d{8})\.pkl',          # Alternative pattern
-                r'model_([A-Z0-9]+)_(\d{8})\.pkl'                  # Future pattern
-            ]
-           
-            for pattern in patterns:
-                match = re.match(pattern, filename)
-                if match:
-                    profile = match.group(1)
-                    date_str = match.group(2)
-                   
-                    if profile in profile_models:
-                        model_info = {
-                            'profile': profile,
-                            'date': date_str,
-                            's3_key': key,
-                            'filename': filename,
-                            'last_modified': obj['LastModified'],
-                            'size': obj['Size'],
-                            'bucket': config["model_bucket"]
-                        }
-                        profile_models[profile].append(model_info)
-                       
-                        # SECURITY FIX: Sanitize filename and profile for logging
-                        safe_filename = sanitize_for_logging(filename, 100)
-                        safe_profile = sanitize_for_logging(profile, 20)
-                        logger.debug(f"Found model filename={safe_filename} profile={safe_profile}")
-                    break
-       
-        # Find appropriate model for each profile
-        for profile, models in profile_models.items():
-            safe_profile = sanitize_for_logging(profile, 20)
-           
-            if models:
-                if training_date:
-                    # Look for models from specific training date first
-                    date_models = [m for m in models if m['date'] == training_date]
-                    if date_models:
-                        # If multiple models from same date, get the most recent by modification time
-                        latest_models[profile] = sorted(date_models, key=lambda x: x['last_modified'], reverse=True)[0]
-                        safe_filename = sanitize_for_logging(latest_models[profile]['filename'], 100)
-                        safe_training_date = sanitize_for_logging(training_date, 20)
-                        logger.info(f"Found model from training date profile={safe_profile} date={safe_training_date} filename={safe_filename}")
-                    else:
-                        # Fallback to most recent model if no model from specific date
-                        latest_model = sorted(models, key=lambda x: x['date'], reverse=True)[0]
-                        latest_models[profile] = latest_model
-                        safe_filename = sanitize_for_logging(latest_model['filename'], 100)
-                        safe_training_date = sanitize_for_logging(training_date, 20)
-                        logger.warning(f"No model found from specific date, using latest profile={safe_profile} requested_date={safe_training_date} latest_filename={safe_filename}")
-                else:
-                    # Get most recent model
-                    latest_model = sorted(models, key=lambda x: x['date'], reverse=True)[0]
-                    latest_models[profile] = latest_model
-                    safe_filename = sanitize_for_logging(latest_model['filename'], 100)
-                    logger.info(f"Found latest model profile={safe_profile} filename={safe_filename}")
-            else:
-                logger.warning(f"No models found profile={safe_profile}")
-       
-        found_count = len(latest_models)
-        logger.info(f"Model discovery completed models_found={found_count}")
-        return latest_models
-       
+        logger.info("Starting enhanced model registry workflow")
+        
+        # Step 1: Scan for available models
+        logger.info("Step 1: Scanning for available models")
+        available_models = scan_for_profile_models(config)
+        
+        if not available_models:
+            logger.warning("No models found in S3")
+            return {
+                'stage': 'model_scanning',
+                'status': 'no_models_found',
+                'available_models': {},
+                'message': 'No models found in S3 model bucket',
+                'execution_id': execution_id,
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        logger.info(f"Found {len(available_models)} models")
+        
+        # Step 2: Register models with SageMaker
+        logger.info("Step 2: Registering models with SageMaker")
+        registration_results = register_models_with_sagemaker(available_models, config, training_metadata, execution_id)
+        
+        # Step 3: Create model packages
+        logger.info("Step 3: Creating model packages")
+        model_package_results = create_model_packages(registration_results, config, execution_id)
+        
+        # Step 4: Store registry metadata
+        logger.info("Step 4: Storing registry metadata")
+        metadata_result = store_registry_metadata(model_package_results, config, training_metadata, execution_id)
+        
+        # Determine approved models for next stage
+        approved_models = {}
+        for profile, package_info in model_package_results.items():
+            if package_info.get('status') == 'success':
+                approved_models[profile] = {
+                    'model_package_arn': package_info['model_package_arn'],
+                    'model_name': package_info['model_name'],
+                    'profile': profile,
+                    'registration_date': package_info['timestamp']
+                }
+        
+        # Return comprehensive results
+        result = {
+            'stage': 'complete',
+            'status': 'success',
+            'execution_id': execution_id,
+            'available_models': available_models,
+            'registration_results': registration_results,
+            'model_package_results': model_package_results,
+            'approved_models': approved_models,
+            'metadata_storage': metadata_result,
+            'summary': {
+                'total_models_found': len(available_models),
+                'total_models_registered': len([r for r in registration_results.values() if r.get('status') == 'success']),
+                'total_packages_created': len([p for p in model_package_results.values() if p.get('status') == 'success']),
+                'approved_models_count': len(approved_models)
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Enhanced model registry workflow completed successfully: {len(approved_models)} approved models")
+        return result
+        
     except Exception as e:
-        error_msg = sanitize_for_logging(str(e))
-        logger.error(f"Error finding latest models error={error_msg}")
+        error_message = sanitize_for_logging(str(e), 200)
+        logger.error(f"Enhanced model registry workflow failed: {error_message}")
+        
+        return {
+            'stage': 'workflow_error',
+            'status': 'failed',
+            'error': error_message,
+            'execution_id': execution_id,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def scan_for_profile_models(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Scan S3 for available trained models for each profile
+    """
+    
+    available_models = {}
+    model_bucket = config['model_bucket']
+    model_prefix = config['model_prefix']
+    profiles = config['profiles']
+    
+    try:
+        for profile in profiles:
+            try:
+                # Look for model artifacts for this profile
+                profile_prefix = f"{model_prefix}{profile}/"
+                
+                safe_profile = sanitize_for_logging(profile, 20)
+                safe_bucket = sanitize_for_logging(model_bucket, 100)
+                logger.info(f"Scanning for models profile={safe_profile} bucket={safe_bucket}")
+                
+                response = s3_client.list_objects_v2(
+                    Bucket=model_bucket,
+                    Prefix=profile_prefix,
+                    MaxKeys=100
+                )
+                
+                if 'Contents' in response:
+                    # Find model.tar.gz files
+                    model_files = []
+                    for obj in response['Contents']:
+                        if obj['Key'].endswith('model.tar.gz'):
+                            model_files.append({
+                                'key': obj['Key'],
+                                'last_modified': obj['LastModified'],
+                                'size': obj['Size']
+                            })
+                    
+                    if model_files:
+                        # Get the most recent model
+                        latest_model = max(model_files, key=lambda x: x['last_modified'])
+                        
+                        available_models[profile] = {
+                            'profile': profile,
+                            's3_path': f"s3://{model_bucket}/{latest_model['key']}",
+                            'last_modified': latest_model['last_modified'].isoformat(),
+                            'size_bytes': latest_model['size'],
+                            'model_count': len(model_files)
+                        }
+                        
+                        logger.info(f"Found model for profile={safe_profile} path={sanitize_for_logging(latest_model['key'], 100)}")
+                    else:
+                        logger.info(f"No model files found for profile={safe_profile}")
+                else:
+                    logger.info(f"No objects found for profile={safe_profile}")
+                    
+            except Exception as e:
+                error_msg = sanitize_for_logging(str(e), 100)
+                logger.error(f"Error scanning models for profile={safe_profile}: {error_msg}")
+        
+        return available_models
+        
+    except Exception as e:
+        logger.error(f"Error scanning for profile models: {str(e)}")
         return {}
 
-def create_model_package_groups(profiles: list, customer_profile: str) -> Dict[str, str]:
+def register_models_with_sagemaker(available_models: Dict[str, Dict[str, Any]], config: Dict[str, Any], 
+                                 training_metadata: Dict[str, Any], execution_id: str) -> Dict[str, Dict[str, Any]]:
     """
-    Enhanced model package group creation with better error handling
+    Register models with SageMaker Model Registry
     """
-    registry_groups = {}
-   
-    for profile in profiles:
-        group_name = f"EnergyForecastModels-{customer_profile}-{profile}"
-        safe_group_name = sanitize_for_logging(group_name, 100)
-        safe_profile = sanitize_for_logging(profile, 20)
-       
+    
+    registration_results = {}
+    
+    # Get execution role from environment
+    execution_role = os.environ.get('SAGEMAKER_EXECUTION_ROLE')
+    if not execution_role:
+        raise ValueError("SAGEMAKER_EXECUTION_ROLE environment variable is required")
+    
+    for profile, model_info in available_models.items():
         try:
-            # Check if group exists
-            sagemaker_client.describe_model_package_group(
-                ModelPackageGroupName=group_name
+            safe_profile = sanitize_for_logging(profile, 20)
+            logger.info(f"Registering model for profile={safe_profile}")
+            
+            # Create unique model name
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            model_name = f"energy-forecasting-{profile.lower()}-{timestamp}-{execution_id[:8]}"
+            
+            # Create inference image URI (this would be your custom inference container)
+            account_id = config['account_id']
+            region = config['region']
+            inference_image = f"{account_id}.dkr.ecr.{region}.amazonaws.com/energy-prediction:latest"
+            
+            # Create the model
+            sagemaker_client.create_model(
+                ModelName=model_name,
+                PrimaryContainer={
+                    'Image': inference_image,
+                    'ModelDataUrl': model_info['s3_path'],
+                    'Environment': {
+                        'PROFILE': profile,
+                        'MODEL_VERSION': timestamp,
+                        'SAGEMAKER_PROGRAM': 'inference.py',
+                        'SAGEMAKER_SUBMIT_DIRECTORY': '/opt/ml/code'
+                    }
+                },
+                ExecutionRoleArn=execution_role
             )
-            logger.info(f"Model package group already exists profile={safe_profile} group={safe_group_name}")
-           
-        except sagemaker_client.exceptions.ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == 'ValidationException' and "does not exist" in str(e):
-                # Create new group
-                logger.info(f"Creating model package group profile={safe_profile} group={safe_group_name}")
-                try:
-                    sagemaker_client.create_model_package_group(
-                        ModelPackageGroupName=group_name,
-                        ModelPackageGroupDescription=f"Energy load forecasting models for {customer_profile} customer profile {profile}"
-                    )
-                    logger.info(f"Successfully created model package group profile={safe_profile} group={safe_group_name}")
-                except Exception as create_error:
-                    error_msg = sanitize_for_logging(str(create_error))
-                    logger.error(f"Failed to create model package group profile={safe_profile} group={safe_group_name} error={error_msg}")
-                    continue
-            else:
-                error_msg = sanitize_for_logging(str(e))
-                logger.error(f"Error checking model package group profile={safe_profile} group={safe_group_name} error={error_msg}")
-                continue
-       
-        registry_groups[profile] = group_name
-   
-    groups_ready_count = len(registry_groups)
-    logger.info(f"Model package groups ready count={groups_ready_count}")
-    return registry_groups
+            
+            registration_results[profile] = {
+                'status': 'success',
+                'model_name': model_name,
+                'profile': profile,
+                's3_path': model_info['s3_path'],
+                'inference_image': inference_image,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            safe_model_name = sanitize_for_logging(model_name, 100)
+            logger.info(f"Successfully registered model profile={safe_profile} model_name={safe_model_name}")
+            
+        except Exception as e:
+            error_msg = sanitize_for_logging(str(e), 100)
+            safe_profile = sanitize_for_logging(profile, 20)
+            logger.error(f"Failed to register model profile={safe_profile}: {error_msg}")
+            
+            registration_results[profile] = {
+                'status': 'failed',
+                'error': error_msg,
+                'profile': profile,
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    return registration_results
 
-def create_enhanced_inference_script(profile: str) -> str:
+def create_model_packages(registration_results: Dict[str, Dict[str, Any]], config: Dict[str, Any], 
+                        execution_id: str) -> Dict[str, Dict[str, Any]]:
     """
-    Create enhanced SageMaker-compatible inference script with improved error handling
+    Create SageMaker Model Packages for approved models
     """
-   
-    # Enhanced profile-specific feature configurations
-    profile_features = {
-        'RNN': ['Count', 'Year', 'Month', 'Day', 'Hour', 'Weekday', 'Season', 'Holiday', 'Workday', 'Temperature', 'Load_I_lag_14_days', 'Load_lag_70_days'],
-        'RN': ['Count', 'Year', 'Month', 'Day', 'Hour', 'Weekday', 'Season', 'Holiday', 'Workday', 'Temperature', 'Load_I_lag_14_days', 'Load_lag_70_days', 'shortwave_radiation'],
-        'M': ['Count', 'Year', 'Month', 'Day', 'Hour', 'Weekday', 'Season', 'Holiday', 'Workday', 'Temperature', 'Load_I_lag_14_days', 'Load_lag_70_days'],
-        'S': ['Count', 'Year', 'Month', 'Day', 'Hour', 'Weekday', 'Season', 'Holiday', 'Workday', 'Temperature', 'Load_I_lag_14_days', 'Load_lag_70_days'],
-        'AGR': ['Count', 'Year', 'Month', 'Day', 'Hour', 'Weekday', 'Season', 'Holiday', 'Workday', 'Temperature', 'Load_I_lag_14_days', 'Load_lag_70_days'],
-        'L': ['Count', 'Year', 'Month', 'Day', 'Hour', 'Weekday', 'Season', 'Holiday', 'Workday', 'Temperature', 'Load_I_lag_14_days', 'Load_lag_70_days'],
-        'A6': ['Count', 'Year', 'Month', 'Day', 'Hour', 'Weekday', 'Season', 'Holiday', 'Workday', 'Temperature', 'Load_I_lag_14_days', 'Load_lag_70_days']
-    }
-   
-    expected_features = profile_features.get(profile, profile_features['RNN'])
-   
+    
+    model_package_results = {}
+    model_package_group_name = "energy-forecasting-models"
+    
+    # Ensure model package group exists
+    try:
+        sagemaker_client.describe_model_package_group(ModelPackageGroupName=model_package_group_name)
+    except sagemaker_client.exceptions.ClientError:
+        # Create model package group if it doesn't exist
+        sagemaker_client.create_model_package_group(
+            ModelPackageGroupName=model_package_group_name,
+            ModelPackageGroupDescription="Energy Forecasting Model Package Group"
+        )
+        logger.info(f"Created model package group: {model_package_group_name}")
+    
+    for profile, reg_result in registration_results.items():
+        if reg_result.get('status') != 'success':
+            model_package_results[profile] = {
+                'status': 'skipped',
+                'reason': 'registration_failed',
+                'profile': profile
+            }
+            continue
+        
+        try:
+            safe_profile = sanitize_for_logging(profile, 20)
+            logger.info(f"Creating model package for profile={safe_profile}")
+            
+            model_name = reg_result['model_name']
+            inference_image = reg_result['inference_image']
+            s3_path = reg_result['s3_path']
+            
+            # Create model package
+            response = sagemaker_client.create_model_package(
+                ModelPackageGroupName=model_package_group_name,
+                ModelPackageDescription=f"Energy Forecasting Model for {profile} Profile",
+                InferenceSpecification={
+                    'Containers': [
+                        {
+                            'Image': inference_image,
+                            'ModelDataUrl': s3_path,
+                            'Environment': {
+                                'PROFILE': profile,
+                                'MODEL_VERSION': reg_result['timestamp'],
+                                'SAGEMAKER_PROGRAM': 'inference.py',
+                                'SAGEMAKER_SUBMIT_DIRECTORY': '/opt/ml/code'
+                            }
+                        }
+                    ],
+                    'SupportedContentTypes': ['application/json'],
+                    'SupportedResponseMIMETypes': ['application/json'],
+                    'SupportedRealtimeInferenceInstanceTypes': ['ml.t2.medium', 'ml.m5.large'],
+                    'SupportedTransformInstanceTypes': ['ml.m5.large']
+                },
+                ModelApprovalStatus='Approved'
+            )
+            
+            model_package_arn = response['ModelPackageArn']
+            
+            model_package_results[profile] = {
+                'status': 'success',
+                'model_package_arn': model_package_arn,
+                'model_name': model_name,
+                'profile': profile,
+                'inference_image': inference_image,
+                's3_path': s3_path,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            safe_package_arn = sanitize_for_logging(model_package_arn, 100)
+            logger.info(f"Successfully created model package profile={safe_profile} arn={safe_package_arn}")
+            
+        except Exception as e:
+            error_msg = sanitize_for_logging(str(e), 100)
+            safe_profile = sanitize_for_logging(profile, 20)
+            logger.error(f"Failed to create model package profile={safe_profile}: {error_msg}")
+            
+            model_package_results[profile] = {
+                'status': 'failed',
+                'error': error_msg,
+                'profile': profile,
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    return model_package_results
+
+def store_registry_metadata(model_package_results: Dict[str, Dict[str, Any]], config: Dict[str, Any], 
+                          training_metadata: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
+    """
+    Store model registry metadata in S3
+    """
+    
+    try:
+        # Create comprehensive metadata
+        registry_metadata = {
+            'execution_id': execution_id,
+            'timestamp': datetime.now().isoformat(),
+            'model_package_results': model_package_results,
+            'training_metadata': training_metadata,
+            'config_summary': {
+                'model_bucket': config['model_bucket'],
+                'data_bucket': config['data_bucket'],
+                'region': config['region'],
+                'profiles_processed': config['profiles']
+            },
+            'summary': {
+                'total_profiles': len(model_package_results),
+                'successful_packages': len([r for r in model_package_results.values() if r.get('status') == 'success']),
+                'failed_packages': len([r for r in model_package_results.values() if r.get('status') == 'failed'])
+            }
+        }
+        
+        # Store in S3
+        data_bucket = config['data_bucket']
+        registry_prefix = config['registry_prefix']
+        current_date = datetime.now().strftime("%Y%m%d")
+        
+        s3_key = f"{registry_prefix}model_registry_{current_date}_{execution_id[:8]}.json"
+        
+        s3_client.put_object(
+            Bucket=data_bucket,
+            Key=s3_key,
+            Body=json.dumps(registry_metadata, indent=2, default=str),
+            ContentType='application/json'
+        )
+        
+        safe_bucket = sanitize_for_logging(data_bucket, 100)
+        safe_key = sanitize_for_logging(s3_key, 200)
+        logger.info(f"Stored registry metadata bucket={safe_bucket} key={safe_key}")
+        
+        return {
+            'status': 'success',
+            's3_bucket': data_bucket,
+            's3_key': s3_key,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        logger.error(f"Failed to store registry metadata: {error_msg}")
+        
+        return {
+            'status': 'failed',
+            'error': error_msg,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def create_inference_script(profile: str) -> str:
+    """
+    Create a sample inference script for the model
+    This would be embedded in your container or stored separately
+    """
+    
     inference_script = f'''
-import joblib
+"""
+Energy Forecasting Inference Script for {profile} Profile
+"""
+
 import json
+import joblib
 import numpy as np
 import pandas as pd
-import os
-import logging
 from datetime import datetime
+import logging
 
-# Setup enhanced logging
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Enhanced profile-specific configuration
+# Model configuration
 PROFILE = "{profile}"
-EXPECTED_FEATURES = {expected_features}
-MODEL_VERSION = "enhanced_v1.0"
+MODEL_VERSION = "{{model_version}}"
+EXPECTED_FEATURES = [
+    "load", "year", "month", "day", "hour", "dayofweek", 
+    "is_weekend", "is_holiday", "season", "temperature", 
+    "humidity", "cloud_cover"
+]
+
+# Add radiation for RN profile
+if PROFILE == "RN":
+    EXPECTED_FEATURES.append("shortwave_radiation")
 
 def model_fn(model_dir):
-    """Enhanced model loading with error handling and validation"""
+    """Load the model from the model directory"""
     try:
-        model_path = os.path.join(model_dir, "model.pkl")
-       
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found at {{model_path}}")
-       
-        model = joblib.load(model_path)
-       
-        # Enhanced model validation
-        if hasattr(model, 'feature_names_in_'):
-            logger.info(f"Model expects {{len(model.feature_names_in_)}} features")
-       
-        logger.info(f"Enhanced model loaded successfully for profile {{PROFILE}}")
-        logger.info(f"Model type: {{type(model).__name__}}")
-        logger.info(f"Expected features: {{len(EXPECTED_FEATURES)}}")
-       
+        logger.info(f"Loading {{PROFILE}} model from {{model_dir}}")
+        model = joblib.load(f"{{model_dir}}/model.pkl")
+        logger.info(f"Successfully loaded {{PROFILE}} model")
         return model
-       
     except Exception as e:
-        logger.error(f"Enhanced model loading failed: {{str(e)}}")
+        logger.error(f"Failed to load {{PROFILE}} model: {{str(e)}}")
         raise
 
 def input_fn(request_body, content_type):
-    """Enhanced input processing with comprehensive validation"""
+    """Parse input data for inference"""
     try:
-        logger.info(f"Processing input for profile {{PROFILE}}, content_type: {{content_type}}")
-       
+        logger.info(f"Processing input for {{PROFILE}} model, content_type={{content_type}}")
+        
         if content_type == 'application/json':
-            data = json.loads(request_body)
-           
-            # Enhanced input format handling
-            if 'instances' in data:
-                instances = data['instances']
-                logger.info("Processing 'instances' format")
-            elif isinstance(data, list):
-                instances = data
-                logger.info("Processing list format")
-            elif isinstance(data, dict):
-                if 'data' in data:
-                    instances = data['data']
-                    logger.info("Processing 'data' format")
-                else:
-                    instances = [data]
-                    logger.info("Processing single dict format")
+            input_data = json.loads(request_body)
+            
+            # Handle both formats: {{"instances": [[...]]}} and [[...]]
+            if isinstance(input_data, dict) and "instances" in input_data:
+                instances = input_data["instances"]
+            elif isinstance(input_data, list):
+                instances = input_data
             else:
-                raise ValueError(f"Unsupported data format: {{type(data)}}")
-           
-            # Convert to DataFrame for enhanced processing
-            df = pd.DataFrame(instances)
-            logger.info(f"Created DataFrame with {{len(df)}} rows and {{len(df.columns)}} columns")
-           
-            # Enhanced preprocessing
-            df = enhanced_preprocess_features(df)
-           
-            # Enhanced feature validation and completion
-            missing_features = []
-            for feature in EXPECTED_FEATURES:
-                if feature not in df.columns:
-                    missing_features.append(feature)
-                    logger.warning(f"Missing feature {{feature}}, setting to default value")
-                    df[feature] = get_default_value(feature)
-           
-            if missing_features:
-                logger.warning(f"Added default values for {{len(missing_features)}} missing features")
-           
-            # Select and order features correctly
-            df_features = df[EXPECTED_FEATURES]
-           
-            # Enhanced data validation
-            validate_input_data(df_features)
-           
-            logger.info(f"Enhanced input processing completed: {{len(df_features)}} rows, {{len(df_features.columns)}} features")
-            return df_features.values
-           
+                raise ValueError(f"Invalid input format for {{PROFILE}}")
+            
+            # Convert to numpy array
+            input_array = np.array(instances)
+            
+            # Validate feature count
+            expected_features = len(EXPECTED_FEATURES)
+            if input_array.shape[1] != expected_features:
+                raise ValueError(f"{{PROFILE}} model expects {{expected_features}} features, got {{input_array.shape[1]}}")
+            
+            logger.info(f"Successfully processed input for {{PROFILE}}: {{input_array.shape}}")
+            return input_array
+            
         else:
             raise ValueError(f"Unsupported content type: {{content_type}}")
-           
+            
     except Exception as e:
-        logger.error(f"Enhanced input processing failed: {{str(e)}}")
-        raise
-
-def enhanced_preprocess_features(df):
-    """Enhanced feature preprocessing with comprehensive transformations"""
-    try:
-        logger.info("Starting enhanced feature preprocessing")
-       
-        # Enhanced categorical encoding
-        if 'Weekday' in df.columns:
-            if df['Weekday'].dtype == 'object':
-                weekday_map = {{
-                    'Monday': 1, 'Tuesday': 2, 'Wednesday': 3,
-                    'Thursday': 4, 'Friday': 5, 'Saturday': 6, 'Sunday': 7,
-                    'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6, 'Sun': 7
-                }}
-                df['Weekday'] = df['Weekday'].map(weekday_map).fillna(1)
-                logger.info("Enhanced weekday encoding completed")
-       
-        if 'Season' in df.columns:
-            if df['Season'].dtype == 'object':
-                season_map = {{
-                    'Summer': 1, 'Winter': 0, 'summer': 1, 'winter': 0,
-                    'SUMMER': 1, 'WINTER': 0
-                }}
-                df['Season'] = df['Season'].map(season_map).fillna(0)
-                logger.info("Enhanced season encoding completed")
-       
-        # Enhanced missing value handling with profile-specific defaults
-        default_values = get_profile_defaults()
-        df = df.fillna(default_values)
-       
-        # Enhanced data type validation
-        for col in df.columns:
-            if col in EXPECTED_FEATURES:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-       
-        logger.info("Enhanced feature preprocessing completed")
-        return df
-       
-    except Exception as e:
-        logger.error(f"Enhanced preprocessing failed: {{str(e)}}")
-        raise
-
-def get_default_value(feature_name):
-    """Get enhanced default values for missing features"""
-    defaults = {{
-        'Count': 1000,
-        'Year': datetime.now().year,
-        'Month': datetime.now().month,
-        'Day': datetime.now().day,
-        'Hour': 12,
-        'Weekday': 1,
-        'Season': 1,
-        'Holiday': 0,
-        'Workday': 1,
-        'Temperature': 70.0,
-        'Load_I_lag_14_days': 0.5,
-        'Load_lag_70_days': 0.5,
-        'shortwave_radiation': 200.0
-    }}
-    return defaults.get(feature_name, 0)
-
-def get_profile_defaults():
-    """Get profile-specific default values"""
-    base_defaults = {{
-        'Count': 1000,
-        'Temperature': 70.0,
-        'Load_I_lag_14_days': 0.5,
-        'Load_lag_70_days': 0.5,
-        'shortwave_radiation': 200.0,
-        'Holiday': 0,
-        'Workday': 1,
-        'Season': 1,
-        'Weekday': 1
-    }}
-   
-    # Profile-specific adjustments
-    if PROFILE == 'RN':  # Residential with solar
-        base_defaults['shortwave_radiation'] = 300.0
-    elif PROFILE in ['M', 'S']:  # Commercial profiles
-        base_defaults['Count'] = 500
-        base_defaults['Load_I_lag_14_days'] = 0.7
-   
-    return base_defaults
-
-def validate_input_data(df):
-    """Enhanced input data validation"""
-    try:
-        # Check for infinite values
-        if np.isinf(df.values).any():
-            raise ValueError("Input data contains infinite values")
-       
-        # Check for excessive missing values
-        missing_pct = df.isnull().sum().sum() / (len(df) * len(df.columns))
-        if missing_pct > 0.5:
-            raise ValueError(f"Too many missing values: {{missing_pct:.1%}}")
-       
-        # Check data ranges
-        for col in df.columns:
-            if col == 'Temperature' and (df[col].min() < -50 or df[col].max() > 150):
-                logger.warning(f"Temperature values outside expected range: {{df[col].min()}} to {{df[col].max()}}")
-            elif col == 'Hour' and (df[col].min() < 0 or df[col].max() > 23):
-                raise ValueError(f"Hour values outside valid range: {{df[col].min()}} to {{df[col].max()}}")
-       
-        logger.info("Enhanced input validation passed")
-       
-    except Exception as e:
-        logger.error(f"Enhanced input validation failed: {{str(e)}}")
+        logger.error(f"Input processing failed for {{PROFILE}}: {{str(e)}}")
         raise
 
 def predict_fn(input_data, model):
-    """Enhanced prediction with comprehensive error handling"""
+    """Run inference on the input data"""
     try:
-        logger.info(f"Starting enhanced prediction for {{len(input_data)}} samples")
-       
-        # Enhanced prediction with validation
+        logger.info(f"Running prediction for {{PROFILE}} model")
+        logger.info(f"Input shape: {{input_data.shape}}")
+        
+        # Run prediction
         predictions = model.predict(input_data)
-       
-        # Enhanced prediction validation
+        
+        # Validate predictions
         if len(predictions) != len(input_data):
-            raise ValueError(f"Prediction count mismatch: expected {{len(input_data)}}, got {{len(predictions)}}")
-       
+            raise ValueError(f"Prediction count mismatch for {{PROFILE}}: expected {{len(input_data)}}, got {{len(predictions)}}")
+        
         # Check for invalid predictions
         if np.isnan(predictions).any():
             logger.warning("Some predictions are NaN, replacing with median")
             median_pred = np.nanmedian(predictions)
             predictions = np.where(np.isnan(predictions), median_pred, predictions)
-       
+        
         if (predictions < 0).any():
             logger.warning("Some predictions are negative, clipping to zero")
             predictions = np.maximum(predictions, 0)
-       
+        
         logger.info(f"Enhanced prediction completed: {{len(predictions)}} predictions generated")
         logger.info(f"Prediction range: {{predictions.min():.4f}} to {{predictions.max():.4f}}")
-       
+        
         return predictions
-       
+        
     except Exception as e:
         logger.error(f"Enhanced prediction failed: {{str(e)}}")
         raise
@@ -639,14 +604,14 @@ def output_fn(prediction, accept):
     """Enhanced output formatting with comprehensive metadata"""
     try:
         logger.info(f"Formatting enhanced output for {{len(prediction)}} predictions")
-       
+        
         if accept == 'application/json':
             # Convert numpy arrays to lists for JSON serialization
             if hasattr(prediction, 'tolist'):
                 prediction_list = prediction.tolist()
             else:
                 prediction_list = list(prediction)
-           
+            
             # Enhanced response with comprehensive metadata
             response = {{
                 "predictions": prediction_list,
@@ -665,246 +630,16 @@ def output_fn(prediction, accept):
                     "feature_count": len(EXPECTED_FEATURES)
                 }}
             }}
-           
+            
             logger.info("Enhanced output formatting completed")
             return json.dumps(response)
-           
+            
         else:
             raise ValueError(f"Unsupported accept type: {{accept}}")
-           
+            
     except Exception as e:
         logger.error(f"Enhanced output formatting failed: {{str(e)}}")
         raise
 '''
-   
+    
     return inference_script
-
-def create_enhanced_sagemaker_model_archive(profile: str, model_info: Dict[str, Any], config: Dict[str, Any]) -> str:
-    """
-    Create enhanced SageMaker-compatible tar.gz archive with comprehensive packaging
-    """
-   
-    try:
-        # SECURITY FIX: Sanitize profile for logging
-        safe_profile = sanitize_for_logging(profile, 50)
-        logger.info(f"Creating enhanced SageMaker model archive profile={safe_profile}")
-       
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Step 1: Download the pickle file
-            pkl_local_path = os.path.join(temp_dir, 'model.pkl')
-           
-            # SECURITY FIX: Sanitize S3 info for logging
-            safe_bucket = sanitize_for_logging(model_info['bucket'], 100)
-            safe_s3_key = sanitize_for_logging(model_info['s3_key'], 200)
-            logger.info(f"Downloading model bucket={safe_bucket} key={safe_s3_key}")
-           
-            s3_client.download_file(
-                model_info['bucket'],
-                model_info['s3_key'],
-                pkl_local_path
-            )
-            logger.info(f"Successfully downloaded model file profile={safe_profile}")
-           
-            # Step 2: Create enhanced inference script
-            inference_script = create_enhanced_inference_script(profile)
-            inference_path = os.path.join(temp_dir, 'inference.py')
-            with open(inference_path, 'w') as f:
-                f.write(inference_script)
-            logger.info(f"Created enhanced inference script profile={safe_profile}")
-           
-            # Step 3: Create enhanced requirements.txt
-            requirements_content = """joblib>=1.1.0
-scikit-learn==1.3.2
-xgboost==1.7.6
-numpy>=1.21.0
-pandas>=1.5.0
-"""
-            requirements_path = os.path.join(temp_dir, 'requirements.txt')
-            with open(requirements_path, 'w') as f:
-                f.write(requirements_content)
-           
-            # Step 4: Create enhanced model metadata
-            metadata_content = {
-                "profile": profile,
-                "model_type": "XGBoost",
-                "framework": "scikit-learn",
-                "training_date": model_info['date'],
-                "created_at": datetime.now().isoformat(),
-                "sagemaker_compatible": True,
-                "inference_script": "inference.py",
-                "model_file": "model.pkl",
-                "enhancement_version": "v2.0",
-                "original_s3_location": f"s3://{model_info['bucket']}/{model_info['s3_key']}",
-                "model_size_bytes": model_info['size'],
-                "last_modified": model_info['last_modified'].isoformat() if isinstance(model_info['last_modified'], datetime) else str(model_info['last_modified'])
-            }
-           
-            metadata_path = os.path.join(temp_dir, 'model_metadata.json')
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata_content, f, indent=2)
-           
-            # Step 5: Create enhanced tar.gz archive
-            archive_path = os.path.join(temp_dir, 'model.tar.gz')
-            with tarfile.open(archive_path, 'w:gz') as tar:
-                tar.add(pkl_local_path, arcname='model.pkl')
-                tar.add(inference_path, arcname='inference.py')
-                tar.add(requirements_path, arcname='requirements.txt')
-                tar.add(metadata_path, arcname='model_metadata.json')
-           
-            logger.info(f"Created enhanced tar.gz archive profile={safe_profile}")
-           
-            # Step 6: Upload archive to S3 with enhanced naming
-            timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-            archive_s3_key = f"{config['registry_prefix']}{profile}/enhanced_model_{model_info['date']}_{timestamp}.tar.gz"
-           
-            s3_client.upload_file(archive_path, config["model_bucket"], archive_s3_key)
-           
-            archive_s3_uri = f"s3://{config['model_bucket']}/{archive_s3_key}"
-            safe_archive_uri = sanitize_for_logging(archive_s3_uri, 200)
-            logger.info(f"Uploaded enhanced model archive profile={safe_profile} uri={safe_archive_uri}")
-           
-            return archive_s3_uri
-           
-    except Exception as e:
-        error_msg = sanitize_for_logging(str(e))
-        safe_profile = sanitize_for_logging(profile, 50)
-        logger.error(f"Failed to create enhanced model archive profile={safe_profile} error={error_msg}")
-        return None
-
-def process_single_model(profile: str, model_info: Dict[str, Any], config: Dict[str, Any],
-                        registry_group: str, execution_id: str) -> Dict[str, Any]:
-    """
-    Enhanced single model processing with comprehensive error handling and metrics
-    """
-   
-    result = {
-        'profile': profile,
-        'status': 'failed',
-        'execution_id': execution_id,
-        'processing_start_time': datetime.now().isoformat()
-    }
-   
-    try:
-        # SECURITY FIX: Sanitize profile for logging
-        safe_profile = sanitize_for_logging(profile, 50)
-        logger.info(f"Starting enhanced processing profile={safe_profile}")
-       
-        # Step 1: Create enhanced SageMaker model archive
-        archive_s3_uri = create_enhanced_sagemaker_model_archive(profile, model_info, config)
-       
-        if not archive_s3_uri:
-            result['error'] = "Failed to create enhanced model archive"
-            result['processing_end_time'] = datetime.now().isoformat()
-            return result
-       
-        result['archive_s3_uri'] = archive_s3_uri
-       
-        # Step 2: Register model in SageMaker Model Registry with enhancements
-        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-       
-        model_package_response = sagemaker_client.create_model_package(
-            ModelPackageGroupName=registry_group,
-            ModelPackageDescription=f"Enhanced energy forecasting model for {profile} profile - {timestamp}",
-            InferenceSpecification={
-                'Containers': [
-                    {
-                        'Image': '246618743249.dkr.ecr.us-west-2.amazonaws.com/sagemaker-scikit-learn:1.0-1-cpu-py3',
-                        'ModelDataUrl': archive_s3_uri,
-                        'Environment': {
-                            'SAGEMAKER_PROGRAM': 'inference.py',
-                            'SAGEMAKER_SUBMIT_DIRECTORY': '/opt/ml/model',
-                            'SAGEMAKER_CONTAINER_LOG_LEVEL': '20',
-                            'SAGEMAKER_REGION': config['region'],
-                            'MODEL_PROFILE': profile,
-                            'MODEL_VERSION': 'enhanced_v2.0'
-                        }
-                    }
-                ],
-                'SupportedTransformInstanceTypes': ['ml.m5.large', 'ml.m5.xlarge'],
-                'SupportedRealtimeInferenceInstanceTypes': ['ml.m5.large', 'ml.m5.xlarge', 'ml.t2.medium'],
-                'SupportedContentTypes': ['application/json'],
-                'SupportedResponseMIMETypes': ['application/json']
-            },
-            ModelApprovalStatus='Approved'  # Auto-approve enhanced models
-        )
-       
-        model_package_arn = model_package_response['ModelPackageArn']
-       
-        # Enhanced result with comprehensive information
-        result.update({
-            'model_package_arn': model_package_arn,
-            'model_package_group': registry_group,
-            'status': 'success',
-            'approval_status': 'Approved',
-            'registration_time': datetime.now().isoformat(),
-            'processing_end_time': datetime.now().isoformat(),
-            'model_metadata': {
-                'original_s3_key': model_info['s3_key'],
-                'model_size_bytes': model_info['size'],
-                'training_date': model_info['date'],
-                'filename': model_info['filename']
-            },
-            'enhancement_features': [
-                'comprehensive_error_handling',
-                'enhanced_input_validation',
-                'profile_specific_defaults',
-                'advanced_preprocessing',
-                'detailed_logging'
-            ]
-        })
-       
-        safe_model_package_arn = sanitize_for_logging(model_package_arn, 200)
-        logger.info(f"Successfully processed enhanced model profile={safe_profile} arn={safe_model_package_arn}")
-       
-        return result
-       
-    except Exception as e:
-        error_msg = sanitize_for_logging(str(e))
-        safe_profile = sanitize_for_logging(profile, 50)
-        logger.error(f"Failed to process enhanced model profile={safe_profile} error={error_msg}")
-        result.update({
-            'error': error_msg,
-            'processing_end_time': datetime.now().isoformat()
-        })
-        return result
-
-def generate_processing_summary(latest_models: Dict, processing_results: Dict,
-                              successful_count: int, execution_id: str) -> Dict:
-    """
-    Generate comprehensive processing summary with enhanced metrics
-    """
-   
-    summary = {
-        'execution_id': execution_id,
-        'total_profiles_expected': len(['RNN', 'RN', 'M', 'S', 'AGR', 'L', 'A6']),
-        'models_found': len(latest_models),
-        'models_processed': len(processing_results),
-        'successful_registrations': successful_count,
-        'failed_registrations': len(processing_results) - successful_count,
-        'success_rate_percent': (successful_count / len(processing_results)) * 100 if processing_results else 0,
-        'processing_timestamp': datetime.now().isoformat(),
-        'profile_status': {}
-    }
-   
-    # Add detailed profile status
-    all_profiles = ['RNN', 'RN', 'M', 'S', 'AGR', 'L', 'A6']
-    for profile in all_profiles:
-        if profile in processing_results:
-            result = processing_results[profile]
-            summary['profile_status'][profile] = {
-                'status': result['status'],
-                'model_found': profile in latest_models,
-                'registered': result['status'] == 'success',
-                'error': result.get('error', None)
-            }
-            if result['status'] == 'success':
-                summary['profile_status'][profile]['model_package_arn'] = result.get('model_package_arn')
-        else:
-            summary['profile_status'][profile] = {
-                'status': 'not_processed',
-                'model_found': profile in latest_models,
-                'registered': False,
-                'error': 'Model not found or not processed'
-            }
-   
-    return summary

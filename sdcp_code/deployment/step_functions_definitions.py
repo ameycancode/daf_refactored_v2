@@ -69,13 +69,18 @@ def get_training_pipeline_definition(roles, account_id, region, data_bucket, mod
                     "ProcessingResources": {
                         "ClusterConfig": {
                             "InstanceCount": 1,
-                            "InstanceType": "ml.m5.xlarge",
-                            "VolumeSizeInGB": 30
+                            "InstanceType": "ml.m5.4xlarge",
+                            "VolumeSizeInGB": 100
                         }
                     },
                     "AppSpecification": {
                         "ImageUri.$": "$.PreprocessingImageUri",
                         "ContainerEntrypoint": ["python", "/opt/ml/processing/code/src/main.py"]
+                    },
+                    "Environment": {
+                        "PYTHONUNBUFFERED": "1",
+                        "MEMORY_OPTIMIZATION":  "1",
+                        "CHUNK_SIZE": "50000"
                     },
                     "ProcessingInputs": [
                         {
@@ -88,26 +93,9 @@ def get_training_pipeline_definition(roles, account_id, region, data_bucket, mod
                             }
                         }
                     ],
-                    # "ProcessingOutputs": [
-                    #     {
-                    #         "OutputName": "processed-data",
-                    #         "S3Output": {
-                    #             "S3Uri": f"s3://{data_bucket}/archived_folders/forecasting/data/xgboost/processed/",
-                    #             "LocalPath": "/opt/ml/processing/output/processed",
-                    #             "S3UploadMode": "EndOfJob"
-                    #         }
-                    #     },
-                    #     {
-                    #         "OutputName": "model-input",
-                    #         "S3Output": {
-                    #             "S3Uri": f"s3://{data_bucket}/archived_folders/forecasting/data/xgboost/input/",
-                    #             "LocalPath": "/opt/ml/processing/output/input",
-                    #             "S3UploadMode": "EndOfJob"
-                    #         }
-                    #     }
-                    # ],
                     "RoleArn": roles['datascientist_role']
                 },
+                "TimeoutSecond": 7200,
                 "Next": "TrainingJob",
                 "Catch": [
                     {
@@ -144,16 +132,6 @@ def get_training_pipeline_definition(roles, account_id, region, data_bucket, mod
                             }
                         }
                     ],
-                    # "ProcessingOutputs": [
-                    #     {
-                    #         "OutputName": "models",
-                    #         "S3Output": {
-                    #             "S3Uri": f"s3://{model_bucket}/xgboost/",
-                    #             "LocalPath": "/opt/ml/processing/output",
-                    #             "S3UploadMode": "EndOfJob"
-                    #         }
-                    #     }
-                    # ],
                     "RoleArn": roles['datascientist_role'],
                     "Environment": {
                         "MODEL_REGISTRY_LAMBDA": "energy-forecasting-model-registry",

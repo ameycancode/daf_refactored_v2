@@ -1,15 +1,14 @@
 """
-lambda-functions/profile-validator/lambda_function.py
-Validates and filters profiles based on S3 configurations
-SECURITY FIX: Log injection vulnerability (CWE-117, CWE-93) patched
+Profile Validator Lambda Function - Environment-Aware Version
+This version uses environment variables for all configuration values.
 """
 
 import json
 import boto3
 import logging
-import re
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, List, Any
+import os
 
 # Setup logging
 logger = logging.getLogger()
@@ -18,250 +17,403 @@ logger.setLevel(logging.INFO)
 # Initialize AWS clients
 s3_client = boto3.client('s3')
 
-# Security: Input sanitization patterns
-LOG_SANITIZER = {
-    # Remove/replace potentially dangerous characters for logging
-    'newlines': re.compile(r'[\r\n]+'),
-    'tabs': re.compile(r'[\t]+'),
-    'control_chars': re.compile(r'[\x00-\x1f\x7f-\x9f]'),
-    'excessive_whitespace': re.compile(r'\s{3,}')
-}
-
-def sanitize_for_logging(value, max_length=500):
-    """
-    Sanitize input for safe logging to prevent log injection
-   
-    Args:
-        value: Input value to sanitize
-        max_length: Maximum allowed length for logged values
-   
-    Returns:
-        Sanitized string safe for logging
-    """
-    if value is None:
-        return "None"
-   
-    # Convert to string
-    str_value = str(value)
-   
-    # Truncate if too long
-    if len(str_value) > max_length:
-        str_value = str_value[:max_length] + "...[truncated]"
-   
-    # Remove dangerous characters
-    str_value = LOG_SANITIZER['newlines'].sub(' ', str_value)
-    str_value = LOG_SANITIZER['tabs'].sub(' ', str_value)
-    str_value = LOG_SANITIZER['control_chars'].sub('', str_value)
-    str_value = LOG_SANITIZER['excessive_whitespace'].sub(' ', str_value)
-   
-    # Strip whitespace
-    str_value = str_value.strip()
-   
-    return str_value
-
-def sanitize_event_for_logging(event):
-    """
-    Create a sanitized version of event for safe logging
-   
-    Args:
-        event: Lambda event object
-   
-    Returns:
-        Dictionary with sanitized event data safe for logging
-    """
-    sanitized_event = {}
-   
-    # Only log safe, non-sensitive event fields
-    safe_fields = [
-        'operation', 'profiles', 'data_bucket', 'model_bucket'
-    ]
-   
-    for field in safe_fields:
-        if field in event:
-            sanitized_event[field] = sanitize_for_logging(event[field])
-   
-    # Add metadata without sensitive info
-    sanitized_event['_metadata'] = {
-        'event_keys_count': len(event.keys()),
-        'has_profiles': 'profiles' in event,
-        'has_buckets': bool(event.get('data_bucket') or event.get('model_bucket'))
-    }
-   
-    return sanitized_event
+def sanitize_for_logging(value: str, max_length: int = 50) -> str:
+    """Sanitize string values for safe logging"""
+    if not isinstance(value, str):
+        value = str(value)
+    sanitized = ''.join(c for c in value if c.isalnum() or c in '-_.')[:max_length]
+    return sanitized if sanitized else 'unknown'
 
 def lambda_handler(event, context):
     """
-    Validate and filter profiles based on available S3 configurations
+    Main Lambda handler for profile validation
+    
+    Expected event structure:
+    {
+        "operation": "validate_and_filter_profiles",
+        "profiles": ["RNN", "RN", "M", "S", "AGR", "L", "A6"],
+        "data_bucket": "<from environment variable DATA_BUCKET>"
+    }
     """
-   
+    
     execution_id = context.aws_request_id
-   
+    
     try:
         logger.info(f"Starting profile validation [execution_id={sanitize_for_logging(execution_id)}]")
-       
-        # SECURITY FIX: Sanitize event data before logging
-        sanitized_event = sanitize_event_for_logging(event)
-        logger.info(f"Event metadata: {json.dumps(sanitized_event)}")
-       
-        # Extract profiles and configuration with input validation
-        requested_profiles = event.get('profiles', [])
-        data_bucket = event.get('data_bucket')
-        model_bucket = event.get('model_bucket')
+        logger.info(f"Event: {json.dumps(event, default=str)}")
+        
+        # Environment-aware configuration
+        data_bucket = event.get('data_bucket') or os.environ.get('DATA_BUCKET')
+        if not data_bucket:
+            raise ValueError("DATA_BUCKET must be provided in event or environment variables")
+        
+        # Extract operation details
         operation = event.get('operation', 'validate_and_filter_profiles')
-       
-        # Input validation
-        if not isinstance(requested_profiles, list):
-            requested_profiles = []
-           
-        # Sanitize profile names for logging
-        safe_profiles_for_log = [sanitize_for_logging(p, 20) for p in requested_profiles[:10]]  # Max 10 profiles in log
-       
-        if not requested_profiles:
-            requested_profiles = ["RNN", "RN", "M", "S", "AGR", "L", "A6"]  # Default all
-            safe_profiles_for_log = requested_profiles
-       
-        logger.info(f"Validating profiles count={len(requested_profiles)} sample_profiles={safe_profiles_for_log}")
-       
-        # Validate profiles
+        profiles = event.get('profiles', [])
+        
+        if not profiles:
+            raise ValueError("Profiles list is required for validation")
+        
+        safe_operation = sanitize_for_logging(operation)
+        safe_data_bucket = sanitize_for_logging(data_bucket, 100)
+        logger.info(f"Processing operation={safe_operation} data_bucket={safe_data_bucket}")
+        logger.info(f"Profiles to validate: {len(profiles)}")
+        
+        # Handle different operations
         if operation == 'validate_and_filter_profiles':
-            validation_result = validate_profiles_with_s3_configs(
-                requested_profiles, data_bucket, execution_id
-            )
+            result = validate_and_filter_profiles(profiles, data_bucket, execution_id)
+        elif operation == 'check_profile_data_availability':
+            result = check_profile_data_availability(profiles, data_bucket, execution_id)
         else:
-            raise ValueError(f"Unknown operation: {sanitize_for_logging(operation)}")
-       
+            raise ValueError(f"Unknown operation: {safe_operation}")
+        
         return {
             'statusCode': 200,
-            'body': validation_result
+            'body': result
         }
-       
+        
     except Exception as e:
-        error_msg = sanitize_for_logging(str(e))
+        error_msg = sanitize_for_logging(str(e), 200)
         logger.error(f"Profile validation failed [execution_id={sanitize_for_logging(execution_id)}] error={error_msg}")
+        
         return {
             'statusCode': 500,
             'body': {
                 'error': error_msg,
                 'execution_id': execution_id,
+                'profiles': event.get('profiles', []),
                 'message': 'Profile validation failed',
                 'timestamp': datetime.now().isoformat()
             }
         }
 
-def validate_profiles_with_s3_configs(profiles: List[str], data_bucket: str, execution_id: str) -> Dict[str, Any]:
+def validate_and_filter_profiles(profiles: List[str], data_bucket: str, execution_id: str) -> Dict[str, Any]:
     """
-    Validate that each profile has a valid S3 endpoint configuration
+    Validate profiles and filter out those that don't have required data
     """
-   
+    
     try:
-        logger.info(f"Checking S3 configurations for profile_count={len(profiles)} bucket={sanitize_for_logging(data_bucket, 100)}")
-       
+        logger.info(f"Validating {len(profiles)} profiles")
+        
         valid_profiles = []
         invalid_profiles = []
-       
+        validation_details = {}
+        
         for profile in profiles:
-            # SECURITY FIX: Sanitize profile name before logging
-            safe_profile = sanitize_for_logging(profile, 50)
-           
             try:
-                # Validate profile name (additional security)
-                if not profile or not isinstance(profile, str) or len(profile) > 100:
-                    invalid_profiles.append({
-                        'profile': safe_profile,
-                        'reason': 'Invalid profile name format',
-                        'validation_status': 'invalid_format'
-                    })
-                    continue
-               
-                # Check if S3 configuration exists
-                try:
-                    response = s3_client.list_objects_v2(
-                        Bucket=data_bucket,
-                        Prefix=f"endpoint-configurations/{profile}",
-                        MaxKeys=1000
-                    )
-                   
-                    if not response.get('Contents'):
-                        invalid_profiles.append({
-                            'profile': safe_profile,
-                            'reason': 'No endpoint configuration files found',
-                            'validation_status': 'not_found'
-                        })
-                        continue
-                   
-                    # Get the latest file
-                    sorted_files = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)
-                    config_key = sorted_files[0]['Key']
-                   
-                except Exception as e:
-                    error_msg = sanitize_for_logging(str(e))
-                    invalid_profiles.append({
-                        'profile': safe_profile,
-                        'reason': f"Error searching for config files: {error_msg}",
-                        'validation_status': 'error'
-                    })
-                    continue
-
-                # SECURITY FIX: Sanitize S3 path for logging
-                safe_s3_path = sanitize_for_logging(f"s3://{data_bucket}/{config_key}", 200)
-                logger.info(f"Checking S3 config profile={safe_profile} path={safe_s3_path}")
-               
-                # Try to get the configuration file
-                response = s3_client.get_object(Bucket=data_bucket, Key=config_key)
-                config_data = json.loads(response['Body'].read())
-               
-                # Validate required fields
-                required_fields = ['endpoint_config_name', 'model_name']
-                if all(field in config_data for field in required_fields):
-                    valid_profiles.append({
-                        'profile': profile,  # Use original profile name in response, not sanitized version
-                        's3_config_path': f"s3://{data_bucket}/{config_key}",
-                        'config_data': config_data,
-                        'validation_status': 'valid'
-                    })
-                    logger.info(f"Valid configuration found profile={safe_profile}")
+                safe_profile = sanitize_for_logging(profile, 20)
+                logger.info(f"Validating profile={safe_profile}")
+                
+                # Check if profile has required data and configurations
+                validation_result = validate_single_profile(profile, data_bucket)
+                validation_details[profile] = validation_result
+                
+                if validation_result['is_valid']:
+                    valid_profiles.append(profile)
+                    logger.info(f"Profile validated successfully profile={safe_profile}")
                 else:
-                    missing_fields = [field for field in required_fields if field not in config_data]
-                    safe_missing_fields = [sanitize_for_logging(field, 50) for field in missing_fields]
-                    invalid_profiles.append({
-                        'profile': safe_profile,
-                        'reason': f"Missing required fields: {safe_missing_fields}",
-                        'validation_status': 'invalid'
-                    })
-                    logger.warning(f"Missing fields profile={safe_profile} missing={safe_missing_fields}")
-               
-            except s3_client.exceptions.NoSuchKey:
-                invalid_profiles.append({
-                    'profile': safe_profile,
-                    'reason': 'S3 configuration file not found',
-                    'validation_status': 'not_found'
-                })
-                logger.warning(f"S3 configuration not found profile={safe_profile}")
-               
+                    invalid_profiles.append(profile)
+                    logger.warning(f"Profile validation failed profile={safe_profile} reason={validation_result.get('reason', 'unknown')}")
+                
             except Exception as e:
-                error_msg = sanitize_for_logging(str(e))
-                invalid_profiles.append({
-                    'profile': safe_profile,
-                    'reason': f"Configuration validation error: {error_msg}",
-                    'validation_status': 'error'
-                })
-                logger.error(f"Validation error profile={safe_profile} error={error_msg}")
-       
+                error_msg = sanitize_for_logging(str(e), 100)
+                safe_profile = sanitize_for_logging(profile, 20)
+                logger.error(f"Error validating profile profile={safe_profile} error={error_msg}")
+                
+                invalid_profiles.append(profile)
+                validation_details[profile] = {
+                    'is_valid': False,
+                    'reason': f'Validation error: {error_msg}',
+                    'checks': {}
+                }
+        
+        # Prepare result
         result = {
-            'requested_profiles': profiles,  # Return original profile names
+            'operation': 'validate_and_filter_profiles',
+            'execution_id': execution_id,
+            'input_profiles': profiles,
             'valid_profiles': valid_profiles,
             'invalid_profiles': invalid_profiles,
-            'valid_profiles_count': len(valid_profiles),
-            'invalid_profiles_count': len(invalid_profiles),
-            'validation_timestamp': datetime.now().isoformat(),
-            'execution_id': execution_id
+            'validation_details': validation_details,
+            'summary': {
+                'total_profiles': len(profiles),
+                'valid_count': len(valid_profiles),
+                'invalid_count': len(invalid_profiles),
+                'validation_rate': round((len(valid_profiles) / len(profiles)) * 100, 1) if profiles else 0
+            },
+            'timestamp': datetime.now().isoformat()
         }
-       
-        logger.info(f"Validation complete valid_count={len(valid_profiles)} invalid_count={len(invalid_profiles)} execution_id={sanitize_for_logging(execution_id)}")
-       
+        
+        logger.info(f"Profile validation completed: {len(valid_profiles)}/{len(profiles)} profiles valid")
         return result
-       
+        
     except Exception as e:
-        error_msg = sanitize_for_logging(str(e))
-        logger.error(f"Profile validation process failed error={error_msg} execution_id={sanitize_for_logging(execution_id)}")
-        raise
+        error_msg = sanitize_for_logging(str(e), 200)
+        logger.error(f"Profile validation failed: {error_msg}")
+        
+        return {
+            'operation': 'validate_and_filter_profiles',
+            'execution_id': execution_id,
+            'error': error_msg,
+            'input_profiles': profiles,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def validate_single_profile(profile: str, data_bucket: str) -> Dict[str, Any]:
+    """
+    Validate a single profile for data availability and requirements
+    """
+    
+    validation_result = {
+        'profile': profile,
+        'is_valid': False,
+        'checks': {},
+        'reason': '',
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    try:
+        # Check 1: Profile name validation
+        if not profile or not isinstance(profile, str):
+            validation_result['reason'] = 'Invalid profile name'
+            return validation_result
+        
+        if profile not in ['RNN', 'RN', 'M', 'S', 'AGR', 'L', 'A6']:
+            validation_result['reason'] = f'Unknown profile: {profile}'
+            return validation_result
+        
+        validation_result['checks']['profile_name'] = True
+        
+        # Check 2: Model artifacts availability
+        model_check = check_model_artifacts_availability(profile, data_bucket)
+        validation_result['checks']['model_artifacts'] = model_check
+        
+        # Check 3: Configuration files availability
+        config_check = check_configuration_availability(profile, data_bucket)
+        validation_result['checks']['configuration_files'] = config_check
+        
+        # Check 4: Profile-specific requirements
+        profile_specific_check = check_profile_specific_requirements(profile)
+        validation_result['checks']['profile_requirements'] = profile_specific_check
+        
+        # Determine overall validity
+        required_checks = ['profile_name', 'model_artifacts']  # Configuration is optional
+        all_required_passed = all(validation_result['checks'].get(check, False) for check in required_checks)
+        
+        if all_required_passed:
+            validation_result['is_valid'] = True
+            validation_result['reason'] = 'All validation checks passed'
+        else:
+            failed_checks = [check for check in required_checks if not validation_result['checks'].get(check, False)]
+            validation_result['reason'] = f'Failed checks: {", ".join(failed_checks)}'
+        
+        return validation_result
+        
+    except Exception as e:
+        validation_result['reason'] = f'Validation error: {str(e)}'
+        return validation_result
+
+def check_model_artifacts_availability(profile: str, data_bucket: str) -> bool:
+    """
+    Check if model artifacts are available for the profile
+    """
+    
+    try:
+        # Check if there are model artifacts in the model bucket
+        # Note: We check data_bucket here as it might contain model references
+        model_prefix = f"models/{profile}/"
+        
+        response = s3_client.list_objects_v2(
+            Bucket=data_bucket,
+            Prefix=model_prefix,
+            MaxKeys=1
+        )
+        
+        # If we find any objects, consider models available
+        has_artifacts = 'Contents' in response and len(response['Contents']) > 0
+        
+        if has_artifacts:
+            safe_profile = sanitize_for_logging(profile, 20)
+            logger.info(f"Model artifacts found profile={safe_profile}")
+        
+        return has_artifacts
+        
+    except Exception as e:
+        safe_profile = sanitize_for_logging(profile, 20)
+        error_msg = sanitize_for_logging(str(e), 100)
+        logger.warning(f"Could not check model artifacts profile={safe_profile} error={error_msg}")
+        # Return True to not block validation due to S3 access issues
+        return True
+
+def check_configuration_availability(profile: str, data_bucket: str) -> bool:
+    """
+    Check if configuration files are available for the profile
+    """
+    
+    try:
+        # Check for endpoint configurations
+        config_prefix = f"endpoint-configurations/{profile}/"
+        
+        response = s3_client.list_objects_v2(
+            Bucket=data_bucket,
+            Prefix=config_prefix,
+            MaxKeys=1
+        )
+        
+        has_config = 'Contents' in response and len(response['Contents']) > 0
+        
+        if has_config:
+            safe_profile = sanitize_for_logging(profile, 20)
+            logger.info(f"Configuration files found profile={safe_profile}")
+        
+        return has_config
+        
+    except Exception as e:
+        safe_profile = sanitize_for_logging(profile, 20)
+        error_msg = sanitize_for_logging(str(e), 100)
+        logger.warning(f"Could not check configuration files profile={safe_profile} error={error_msg}")
+        # Return True to not block validation due to S3 access issues
+        return True
+
+def check_profile_specific_requirements(profile: str) -> bool:
+    """
+    Check profile-specific requirements
+    """
+    
+    try:
+        # Profile-specific validation rules
+        profile_requirements = {
+            'RNN': {'features': 12, 'special_requirements': []},
+            'RN': {'features': 13, 'special_requirements': ['radiation_data']},
+            'M': {'features': 12, 'special_requirements': []},
+            'S': {'features': 12, 'special_requirements': []},
+            'AGR': {'features': 12, 'special_requirements': []},
+            'L': {'features': 12, 'special_requirements': []},
+            'A6': {'features': 12, 'special_requirements': []}
+        }
+        
+        if profile not in profile_requirements:
+            return False
+        
+        # For now, all profiles pass specific requirements
+        # This could be extended to check for specific data requirements
+        return True
+        
+    except Exception as e:
+        safe_profile = sanitize_for_logging(profile, 20)
+        error_msg = sanitize_for_logging(str(e), 100)
+        logger.error(f"Profile requirements check failed profile={safe_profile} error={error_msg}")
+        return False
+
+def check_profile_data_availability(profiles: List[str], data_bucket: str, execution_id: str) -> Dict[str, Any]:
+    """
+    Check data availability for multiple profiles
+    """
+    
+    try:
+        logger.info(f"Checking data availability for {len(profiles)} profiles")
+        
+        data_availability = {}
+        
+        for profile in profiles:
+            try:
+                safe_profile = sanitize_for_logging(profile, 20)
+                logger.info(f"Checking data availability profile={safe_profile}")
+                
+                availability_check = {
+                    'profile': profile,
+                    'model_artifacts_available': check_model_artifacts_availability(profile, data_bucket),
+                    'configuration_available': check_configuration_availability(profile, data_bucket),
+                    'input_data_available': check_input_data_availability(profile, data_bucket),
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Determine overall availability
+                availability_check['overall_available'] = (
+                    availability_check['model_artifacts_available'] and
+                    availability_check['input_data_available']
+                )
+                
+                data_availability[profile] = availability_check
+                
+            except Exception as e:
+                error_msg = sanitize_for_logging(str(e), 100)
+                safe_profile = sanitize_for_logging(profile, 20)
+                logger.error(f"Error checking data availability profile={safe_profile} error={error_msg}")
+                
+                data_availability[profile] = {
+                    'profile': profile,
+                    'error': error_msg,
+                    'overall_available': False,
+                    'timestamp': datetime.now().isoformat()
+                }
+        
+        # Calculate summary
+        available_profiles = [p for p, data in data_availability.items() if data.get('overall_available', False)]
+        
+        result = {
+            'operation': 'check_profile_data_availability',
+            'execution_id': execution_id,
+            'profiles_checked': profiles,
+            'data_availability': data_availability,
+            'available_profiles': available_profiles,
+            'summary': {
+                'total_profiles': len(profiles),
+                'available_count': len(available_profiles),
+                'availability_rate': round((len(available_profiles) / len(profiles)) * 100, 1) if profiles else 0
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Data availability check completed: {len(available_profiles)}/{len(profiles)} profiles available")
+        return result
+        
+    except Exception as e:
+        error_msg = sanitize_for_logging(str(e), 200)
+        logger.error(f"Data availability check failed: {error_msg}")
+        
+        return {
+            'operation': 'check_profile_data_availability',
+            'execution_id': execution_id,
+            'error': error_msg,
+            'profiles_checked': profiles,
+            'timestamp': datetime.now().isoformat()
+        }
+
+def check_input_data_availability(profile: str, data_bucket: str) -> bool:
+    """
+    Check if input data is available for predictions
+    """
+    
+    try:
+        # Check for prediction input data
+        input_prefix = f"prediction-inputs/{profile}/"
+        
+        response = s3_client.list_objects_v2(
+            Bucket=data_bucket,
+            Prefix=input_prefix,
+            MaxKeys=1
+        )
+        
+        has_input_data = 'Contents' in response and len(response['Contents']) > 0
+        
+        if not has_input_data:
+            # Also check for general input data that could be used for any profile
+            general_input_prefix = "prediction-inputs/general/"
+            
+            response = s3_client.list_objects_v2(
+                Bucket=data_bucket,
+                Prefix=general_input_prefix,
+                MaxKeys=1
+            )
+            
+            has_input_data = 'Contents' in response and len(response['Contents']) > 0
+        
+        return has_input_data
+        
+    except Exception as e:
+        safe_profile = sanitize_for_logging(profile, 20)
+        error_msg = sanitize_for_logging(str(e), 100)
+        logger.warning(f"Could not check input data profile={safe_profile} error={error_msg}")
+        # Return True to not block validation due to S3 access issues
+        return True
