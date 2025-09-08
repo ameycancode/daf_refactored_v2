@@ -1,7 +1,4 @@
-# =============================================================================
-# MAIN CI/CD WORKFLOW - .github/workflows/deploy-energy-forecasting.yml
-# =============================================================================
-name: 🚀 Energy Forecasting MLOps Deployment
+name: Energy Forecasting MLOps Deployment
 
 on:
   workflow_dispatch:
@@ -39,6 +36,7 @@ on:
       - 'sdcp_code/deployment/**'
       - 'sdcp_code/lambda-functions/**'
       - 'sdcp_code/infrastructure/**'
+      - '.github/workflows/deploy-energy-forecasting.yml'
   pull_request:
     branches: [main, develop]
     paths:
@@ -55,7 +53,7 @@ jobs:
   # JOB 1: DETERMINE ENVIRONMENT AND CONFIGURATION
   # ==========================================================================
   determine_environment:
-    name: 🎯 Environment Setup
+    name: Environment Setup
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.env_setup.outputs.environment }}
@@ -64,21 +62,21 @@ jobs:
       skip_prediction_test: ${{ steps.env_setup.outputs.skip_prediction_test }}
       rebuild_containers: ${{ steps.env_setup.outputs.rebuild_containers }}
       cleanup_after_test: ${{ steps.env_setup.outputs.cleanup_after_test }}
-      sagemaker_role_arn: ${{ steps.env_setup.outputs.sagemaker_role_arn }}
+      # sagemaker_role_arn: ${{ steps.env_setup.outputs.sagemaker_role_arn }}
       deployment_bucket: ${{ steps.env_setup.outputs.deployment_bucket }}
       model_bucket: ${{ steps.env_setup.outputs.model_bucket }}
       pipeline_name: ${{ steps.env_setup.outputs.pipeline_name }}
-    
+   
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 🎯 Determine Environment and Configuration
+      - name: Determine Environment and Configuration
         id: env_setup
         run: |
           # Determine environment
@@ -119,6 +117,9 @@ jobs:
             CLEANUP_AFTER_TEST="true"
           fi
 
+          DEPLOYMENT_BUCKET="sdcp-${ENVIRONMENT}-sagemaker-energy-forecasting-data"
+          MODEL_BUCKET="sdcp-${ENVIRONMENT}-sagemaker-energy-forecasting-models"
+
           echo "=== DEPLOYMENT CONFIGURATION ==="
           echo "Environment: $ENVIRONMENT"
           echo "Test Profiles: $TEST_PROFILES"
@@ -130,25 +131,6 @@ jobs:
           echo "GitHub Ref: ${{ github.ref }}"
           echo "============================="
 
-          # Set environment-specific configurations
-          case $ENVIRONMENT in
-            "dev")
-              SAGEMAKER_ROLE_ARN="arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/sdcp-dev-sagemaker-energy-forecasting-datascientist-role"
-              DEPLOYMENT_BUCKET="sdcp-dev-sagemaker-energy-forecasting-data"
-              MODEL_BUCKET="sdcp-dev-sagemaker-energy-forecasting-models"
-              ;;
-            "preprod")
-              SAGEMAKER_ROLE_ARN="arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/sdcp-preprod-sagemaker-energy-forecasting-datascientist-role"
-              DEPLOYMENT_BUCKET="sdcp-preprod-sagemaker-energy-forecasting-data"
-              MODEL_BUCKET="sdcp-preprod-sagemaker-energy-forecasting-models"
-              ;;
-            "prod")
-              SAGEMAKER_ROLE_ARN="arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/sdcp-prod-sagemaker-energy-forecasting-datascientist-role"
-              DEPLOYMENT_BUCKET="sdcp-prod-sagemaker-energy-forecasting-data"
-              MODEL_BUCKET="sdcp-prod-sagemaker-energy-forecasting-models"
-              ;;
-          esac
-
           PIPELINE_NAME="energy-forecasting-mlops-$ENVIRONMENT"
 
           # Export outputs
@@ -158,61 +140,123 @@ jobs:
           echo "skip_prediction_test=$SKIP_PREDICTION" >> $GITHUB_OUTPUT
           echo "rebuild_containers=$REBUILD_CONTAINERS" >> $GITHUB_OUTPUT
           echo "cleanup_after_test=$CLEANUP_AFTER_TEST" >> $GITHUB_OUTPUT
-          echo "sagemaker_role_arn=$SAGEMAKER_ROLE_ARN" >> $GITHUB_OUTPUT
+          # echo "sagemaker_role_arn=$SAGEMAKER_ROLE_ARN" >> $GITHUB_OUTPUT
           echo "deployment_bucket=$DEPLOYMENT_BUCKET" >> $GITHUB_OUTPUT
           echo "model_bucket=$MODEL_BUCKET" >> $GITHUB_OUTPUT
           echo "pipeline_name=$PIPELINE_NAME" >> $GITHUB_OUTPUT
+
+          echo "Test Profiles: $TEST_PROFILES"
+          echo "Skip Training: $SKIP_TRAINING"
+          echo "Skip Prediction: $SKIP_PREDICTION"
+          echo "Rebuild Containers: $REBUILD_CONTAINERS"
+          echo "Cleanup After Test: $CLEANUP_AFTER_TEST"
+          # echo "Sagemaker Role ARN: $SAGEMAKER_ROLE_ARN"
+          echo "Deployment Bucket: $DEPLOYMENT_BUCKET"
+          echo "Model Bucket: $MODEL_BUCKET"
+          echo "Pipeline Name: $PIPELINE_NAME"
 
   # ==========================================================================
   # JOB 2: BUILD AND PUSH CONTAINERS (IF NEEDED)
   # ==========================================================================
   build_containers:
-    name: 🐳 Build Containers
+    name: Build Containers
     runs-on: ubuntu-latest
     needs: determine_environment
+    environment: ${{ needs.determine_environment.outputs.environment }}
     if: |
       needs.determine_environment.outputs.rebuild_containers == 'true' ||
-      contains(github.event.head_commit.modified, 'containers/') ||
-      contains(github.event.head_commit.added, 'containers/') ||
+      contains(github.event.head_commit.modified, 'sdcp_code/containers/') ||
+      contains(github.event.head_commit.added, 'sdcp_code/containers/') ||
       github.event_name == 'workflow_dispatch'
-    
+
+    env:
+      # Core settings from determine_environment
+      ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+     
+      # AWS configuration
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+ 
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 botocore
 
-      - name: 🔐 Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.determine_environment.outputs.sagemaker_role_arn }}
-          role-session-name: ${{ needs.determine_environment.outputs.pipeline_name }}-container-build-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}          
 
-      - name: 🏗️ Create Container Configuration
+      - name: 🔐 Assume SageMaker Role
+        id: assume_role
+        run: |
+          echo "=== ASSUMING SAGEMAKER ROLE ==="
+          echo "Environment: ${{ needs.determine_environment.outputs.environment }}"
+           
+          echo "Role ARN: $SAGEMAKER_ROLE_ARN"
+          echo "Environment: $ENVIRONMENT"
+          echo "AWS Region: $AWS_REGION"          
+         
+          # Assume SageMaker role
+          echo "Assuming SageMaker role..."
+          ROLE_CREDENTIALS=$(aws sts assume-role \
+            --role-arn "$SAGEMAKER_ROLE_ARN" \
+            --role-session-name "GitHubActions-${{ github.job }}-${{ github.run_id }}" \
+            --output json)
+         
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to assume SageMaker role"
+            exit 1
+          fi
+         
+          # Export credentials as environment variables
+          export AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')
+         
+          # Save to GitHub environment for subsequent steps
+          echo "AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')" >> $GITHUB_ENV
+          echo "SAGEMAKER_ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+         
+          echo "✅ Successfully assumed SageMaker role"
+         
+          # Verify assumed role identity
+          echo "Verifying assumed role identity..."
+          aws sts get-caller-identity
+         
+          # Add repository root to PYTHONPATH
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: Create Container Configuration
         run: |
           python sdcp_code/deployment/container_config_manager.py \
             --environment ${{ needs.determine_environment.outputs.environment }} \
             --generate-configs
 
-      - name: 🐳 Build and Push Containers via CodeBuild
+      - name: Build and Push Containers via CodeBuild
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
         run: |
           echo "Building containers for environment: $ENVIRONMENT"
           python sdcp_code/scripts/build_via_codebuild.py \
-            --region ${{ env.AWS_REGION }} \
+            --region ${{ secrets.AWS_REGION }} \
             --environment $ENVIRONMENT
 
-      - name: 📝 Upload Container Build Summary
+      - name: Upload Container Build Summary
         uses: actions/upload-artifact@v4
         with:
           name: container-build-summary-${{ needs.determine_environment.outputs.environment }}-${{ github.run_id }}
@@ -223,40 +267,92 @@ jobs:
   # JOB 3: DEPLOY MLOPS PIPELINE
   # ==========================================================================
   deploy_mlops:
-    name: 🚀 Deploy MLOps Pipeline
+    name: Deploy MLOps Pipeline
     runs-on: ubuntu-latest
+    environment: ${{ needs.determine_environment.outputs.environment }}
     needs: [determine_environment, build_containers]
     if: always() && needs.determine_environment.result == 'success'
-    
+
+    env:
+      # Core settings from determine_environment
+      ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+     
+      # AWS configuration
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+   
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 botocore pandas numpy scikit-learn xgboost
 
-      - name: 🔐 Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.determine_environment.outputs.sagemaker_role_arn }}
-          role-session-name: ${{ needs.determine_environment.outputs.pipeline_name }}-deploy-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}          
 
-      - name: ✅ Validate Environment
+      - name: 🔐 Assume SageMaker Role
+        id: assume_role
+        run: |
+          echo "=== ASSUMING SAGEMAKER ROLE ==="
+          echo "Environment: ${{ needs.determine_environment.outputs.environment }}"
+         
+          echo "Role ARN: $SAGEMAKER_ROLE_ARN"
+          echo "Environment: $ENVIRONMENT"
+          echo "AWS Region: $AWS_REGION"    
+                 
+          # Assume SageMaker role
+          echo "Assuming SageMaker role..."
+          ROLE_CREDENTIALS=$(aws sts assume-role \
+            --role-arn "$SAGEMAKER_ROLE_ARN" \
+            --role-session-name "GitHubActions-${{ github.job }}-${{ github.run_id }}" \
+            --output json)
+         
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to assume SageMaker role"
+            exit 1
+          fi
+         
+          # Export credentials as environment variables
+          export AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')
+         
+          # Save to GitHub environment for subsequent steps
+          echo "AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')" >> $GITHUB_ENV
+          echo "SAGEMAKER_ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+         
+          echo "✅ Successfully assumed SageMaker role"
+         
+          # Verify assumed role identity
+          echo "Verifying assumed role identity..."
+          aws sts get-caller-identity
+         
+          # Add repository root to PYTHONPATH
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: Validate Environment
         run: |
           echo "=== ENVIRONMENT VALIDATION ==="
           python sdcp_code/deployment/validate_environment.py \
             --environment ${{ needs.determine_environment.outputs.environment }} \
             --pre-deployment-check
 
-      - name: 🚀 Deploy Enhanced MLOps Pipeline
+      - name: Deploy Enhanced MLOps Pipeline
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
           DEPLOYMENT_BUCKET: ${{ needs.determine_environment.outputs.deployment_bucket }}
@@ -267,7 +363,7 @@ jobs:
           echo "Deployment Bucket: $DEPLOYMENT_BUCKET"
           echo "Model Bucket: $MODEL_BUCKET"
           echo "Pipeline Name: ${{ needs.determine_environment.outputs.pipeline_name }}"
-          
+         
           # Run enhanced deployment with CI/CD parameters
           python sdcp_code/deployment/deploy_enhanced_mlops_cicd.py \
             --environment $ENVIRONMENT \
@@ -277,14 +373,14 @@ jobs:
             --deployment-bucket $DEPLOYMENT_BUCKET \
             --model-bucket $MODEL_BUCKET
 
-      - name: ✅ Post-Deployment Validation
+      - name: Post-Deployment Validation
         run: |
           echo "=== POST-DEPLOYMENT VALIDATION ==="
-          python sdcp_code/deployment/validate_environment.py \
+          python deployment/validate_environment.py \
             --environment ${{ needs.determine_environment.outputs.environment }} \
             --post-deployment-check
 
-      - name: 📝 Upload Deployment Summary
+      - name: Upload Deployment Summary
         uses: actions/upload-artifact@v4
         with:
           name: deployment-summary-${{ needs.determine_environment.outputs.environment }}-${{ github.run_id }}
@@ -295,7 +391,7 @@ jobs:
   # JOB 4: TEST TRAINING PIPELINE
   # ==========================================================================
   test_training:
-    name: 🎯 Test Training Pipeline
+    name: Test Training Pipeline
     runs-on: ubuntu-latest
     needs: [determine_environment, deploy_mlops]
     if: |
@@ -303,36 +399,87 @@ jobs:
       needs.determine_environment.result == 'success' &&
       needs.deploy_mlops.result == 'success' &&
       needs.determine_environment.outputs.skip_training_test != 'true'
-    
+
+    env:
+      # Core settings from determine_environment
+      ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+     
+      # AWS configuration
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+   
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 botocore pandas numpy scikit-learn xgboost
 
-      - name: 🔐 Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.determine_environment.outputs.sagemaker_role_arn }}
-          role-session-name: ${{ needs.determine_environment.outputs.pipeline_name }}-training-test-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}          
 
-      - name: 🎯 Test Training Pipeline
+      - name: 🔐 Assume SageMaker Role
+        id: assume_role
+        run: |
+          echo "=== ASSUMING SAGEMAKER ROLE ==="
+          echo "Environment: ${{ needs.determine_environment.outputs.environment }}"
+         
+          echo "Role ARN: $SAGEMAKER_ROLE_ARN"
+          echo "Environment: $ENVIRONMENT"
+          echo "AWS Region: $AWS_REGION"    
+         
+          # Assume SageMaker role
+          echo "Assuming SageMaker role..."
+          ROLE_CREDENTIALS=$(aws sts assume-role \
+            --role-arn "$SAGEMAKER_ROLE_ARN" \
+            --role-session-name "GitHubActions-${{ github.job }}-${{ github.run_id }}" \
+            --output json)
+         
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to assume SageMaker role"
+            exit 1
+          fi
+         
+          # Export credentials as environment variables
+          export AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')
+         
+          # Save to GitHub environment for subsequent steps
+          echo "AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')" >> $GITHUB_ENV
+          echo "SAGEMAKER_ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+         
+          echo "✅ Successfully assumed SageMaker role"
+         
+          # Verify assumed role identity
+          echo "Verifying assumed role identity..."
+          aws sts get-caller-identity
+         
+          # Add repository root to PYTHONPATH
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: Test Training Pipeline
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
         run: |
           echo "=== TESTING TRAINING PIPELINE ==="
           echo "Environment: $ENVIRONMENT"
           echo "Testing all 7 profiles (sequential execution)"
-          
+         
           python sdcp_code/scripts/test_training_pipeline_cicd.py \
             --environment $ENVIRONMENT \
             --region ${{ env.AWS_REGION }} \
@@ -340,7 +487,7 @@ jobs:
             --ci-cd-mode \
             --timeout-minutes 90
 
-      - name: 📝 Upload Training Test Results
+      - name: Upload Training Test Results
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -352,7 +499,7 @@ jobs:
   # JOB 5: TEST PREDICTION PIPELINE
   # ==========================================================================
   test_prediction:
-    name: 🔮 Test Prediction Pipeline
+    name: Test Prediction Pipeline
     runs-on: ubuntu-latest
     needs: [determine_environment, deploy_mlops]
     if: |
@@ -360,7 +507,16 @@ jobs:
       needs.determine_environment.result == 'success' &&
       needs.deploy_mlops.result == 'success' &&
       needs.determine_environment.outputs.skip_prediction_test != 'true'
-    
+
+    env:
+      # Core settings from determine_environment
+      ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+     
+      # AWS configuration
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+   
     strategy:
       matrix:
         test_case:
@@ -374,29 +530,71 @@ jobs:
             profiles: "all"
             timeout: 30
       fail-fast: false
-    
+   
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 botocore pandas numpy scikit-learn xgboost
 
-      - name: 🔐 Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.determine_environment.outputs.sagemaker_role_arn }}
-          role-session-name: ${{ needs.determine_environment.outputs.pipeline_name }}-prediction-test-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}          
 
-      - name: 🔮 Test Prediction Pipeline - ${{ matrix.test_case.name }}
+      - name: 🔐 Assume SageMaker Role
+        id: assume_role
+        run: |
+          echo "=== ASSUMING SAGEMAKER ROLE ==="
+          echo "Environment: ${{ needs.determine_environment.outputs.environment }}"
+         
+          echo "Role ARN: $SAGEMAKER_ROLE_ARN"
+          echo "Environment: $ENVIRONMENT"
+          echo "AWS Region: $AWS_REGION"    
+         
+          # Assume SageMaker role
+          echo "Assuming SageMaker role..."
+          ROLE_CREDENTIALS=$(aws sts assume-role \
+            --role-arn "$SAGEMAKER_ROLE_ARN" \
+            --role-session-name "GitHubActions-${{ github.job }}-${{ github.run_id }}" \
+            --output json)
+         
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to assume SageMaker role"
+            exit 1
+          fi
+         
+          # Export credentials as environment variables
+          export AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')
+         
+          # Save to GitHub environment for subsequent steps
+          echo "AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')" >> $GITHUB_ENV
+          echo "SAGEMAKER_ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+         
+          echo "✅ Successfully assumed SageMaker role"
+         
+          # Verify assumed role identity
+          echo "Verifying assumed role identity..."
+          aws sts get-caller-identity
+         
+          # Add repository root to PYTHONPATH
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: Test Prediction Pipeline - ${{ matrix.test_case.name }}
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
           TEST_PROFILES: ${{ matrix.test_case.profiles }}
@@ -406,7 +604,7 @@ jobs:
           echo "Environment: $ENVIRONMENT"
           echo "Test Profiles: $TEST_PROFILES"
           echo "Timeout: $TIMEOUT_MINUTES minutes"
-          
+         
           python sdcp_code/scripts/test_enhanced_prediction_pipeline_cicd.py \
             --environment $ENVIRONMENT \
             --region ${{ env.AWS_REGION }} \
@@ -415,7 +613,7 @@ jobs:
             --timeout-minutes $TIMEOUT_MINUTES \
             --test-case "${{ matrix.test_case.name }}"
 
-      - name: 📝 Upload Prediction Test Results
+      - name: Upload Prediction Test Results
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -427,44 +625,95 @@ jobs:
   # JOB 6: INTEGRATION VALIDATION
   # ==========================================================================
   validate_integration:
-    name: ✅ Integration Validation
+    name: Integration Validation
     runs-on: ubuntu-latest
     needs: [determine_environment, deploy_mlops, test_training, test_prediction]
     if: always() && needs.determine_environment.result == 'success' && needs.deploy_mlops.result == 'success'
-    
+
+    env:
+      # Core settings from determine_environment
+      ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+     
+      # AWS configuration
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+   
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 botocore
 
-      - name: 🔐 Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.determine_environment.outputs.sagemaker_role_arn }}
-          role-session-name: ${{ needs.determine_environment.outputs.pipeline_name }}-validation-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}          
 
-      - name: ✅ Run Complete Integration Validation
+      - name: 🔐 Assume SageMaker Role
+        id: assume_role
+        run: |
+          echo "=== ASSUMING SAGEMAKER ROLE ==="
+          echo "Environment: ${{ needs.determine_environment.outputs.environment }}"
+         
+          echo "Role ARN: $SAGEMAKER_ROLE_ARN"
+          echo "Environment: $ENVIRONMENT"
+          echo "AWS Region: $AWS_REGION"    
+         
+          # Assume SageMaker role
+          echo "Assuming SageMaker role..."
+          ROLE_CREDENTIALS=$(aws sts assume-role \
+            --role-arn "$SAGEMAKER_ROLE_ARN" \
+            --role-session-name "GitHubActions-${{ github.job }}-${{ github.run_id }}" \
+            --output json)
+         
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to assume SageMaker role"
+            exit 1
+          fi
+         
+          # Export credentials as environment variables
+          export AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')
+         
+          # Save to GitHub environment for subsequent steps
+          echo "AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')" >> $GITHUB_ENV
+          echo "SAGEMAKER_ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+         
+          echo "✅ Successfully assumed SageMaker role"
+         
+          # Verify assumed role identity
+          echo "Verifying assumed role identity..."
+          aws sts get-caller-identity
+         
+          # Add repository root to PYTHONPATH
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: Run Complete Integration Validation
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
         run: |
           echo "=== COMPLETE INTEGRATION VALIDATION ==="
           echo "Environment: $ENVIRONMENT"
-          
+         
           python sdcp_code/deployment/validate_environment.py \
             --environment $ENVIRONMENT \
             --complete-integration-check
 
-      - name: 📝 Upload Integration Validation Results
+      - name: Upload Integration Validation Results
         uses: actions/upload-artifact@v4
         with:
           name: integration-validation-${{ needs.determine_environment.outputs.environment }}-${{ github.run_id }}
@@ -475,50 +724,107 @@ jobs:
   # JOB 7: COST OPTIMIZATION & CLEANUP
   # ==========================================================================
   cleanup_resources:
-    name: 🧹 Cost Optimization Cleanup
+    name: Cost Optimization Cleanup
     runs-on: ubuntu-latest
     needs: [determine_environment, deploy_mlops, test_training, test_prediction, validate_integration]
     if: |
       always() &&
       needs.determine_environment.result == 'success' &&
       needs.determine_environment.outputs.cleanup_after_test == 'true'
-    
+
+    env:
+      # Core settings from determine_environment
+      ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+     
+      # AWS configuration
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+   
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 botocore
 
-      - name: 🔐 Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.determine_environment.outputs.sagemaker_role_arn }}
-          role-session-name: ${{ needs.determine_environment.outputs.pipeline_name }}-cleanup-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}          
 
-      - name: 🧹 Cost Optimization Cleanup
+      - name: 🔐 Assume SageMaker Role
+        id: assume_role
+        run: |
+          echo "=== ASSUMING SAGEMAKER ROLE ==="
+          echo "Environment: ${{ needs.determine_environment.outputs.environment }}"
+         
+          echo "Role ARN: $SAGEMAKER_ROLE_ARN"
+          echo "Environment: $ENVIRONMENT"
+          echo "AWS Region: $AWS_REGION"    
+         
+          # Assume SageMaker role
+          echo "Assuming SageMaker role..."
+          ROLE_CREDENTIALS=$(aws sts assume-role \
+            --role-arn "$SAGEMAKER_ROLE_ARN" \
+            --role-session-name "GitHubActions-${{ github.job }}-${{ github.run_id }}" \
+            --output json)
+         
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to assume SageMaker role"
+            exit 1
+          fi
+         
+          # Export credentials as environment variables
+          export AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')
+         
+          # Save to GitHub environment for subsequent steps
+          echo "AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.AccessKeyId')" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SecretAccessKey')" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq -r '.Credentials.SessionToken')" >> $GITHUB_ENV
+          echo "SAGEMAKER_ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+         
+          echo "✅ Successfully assumed SageMaker role"
+         
+          # Verify assumed role identity
+          echo "Verifying assumed role identity..."
+          aws sts get-caller-identity
+         
+          # Add repository root to PYTHONPATH
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+      - name: 🧹 Execute Cost Optimization Cleanup
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+          CLEANUP_AFTER_TEST: ${{ needs.determine_environment.outputs.cleanup_after_test }}
         run: |
-          echo "=== COST OPTIMIZATION CLEANUP ==="
+          echo "=== EXECUTING COST OPTIMIZATION CLEANUP ==="
           echo "Environment: $ENVIRONMENT"
-          echo "Cleaning up test resources (preserving S3 data)"
-          
-          python sdcp_code/deployment/cleanup_enhanced_mlops.py \
-            --environment $ENVIRONMENT \
-            --cleanup-test-resources \
-            --preserve-s3 \
-            --github-run-id ${{ github.run_id }}
+          echo "Cleanup After Test: $CLEANUP_AFTER_TEST"
+         
+          if [ "$CLEANUP_AFTER_TEST" = "true" ]; then
+            echo "Running cleanup for test resources only (preserving S3 data)..."
+            python sdcp_code/deployment/cleanup_enhanced_mlops.py \
+              --environment $ENVIRONMENT \
+              --region ${{ env.AWS_REGION }} \
+              --confirm \
+              --preserve-s3
+          else
+            echo "Cleanup skipped (cleanup_after_test=false)"
+          fi
 
-      - name: 📝 Upload Cleanup Summary
+      - name: Upload Cleanup Summary
         uses: actions/upload-artifact@v4
         with:
           name: cleanup-summary-${{ needs.determine_environment.outputs.environment }}-${{ github.run_id }}
@@ -529,29 +835,38 @@ jobs:
   # JOB 8: DEPLOYMENT SUMMARY & REPORTING
   # ==========================================================================
   create_summary:
-    name: 📊 Create Deployment Summary
+    name: Create Deployment Summary
     runs-on: ubuntu-latest
     needs: [determine_environment, deploy_mlops, test_training, test_prediction, validate_integration, cleanup_resources]
     if: always() && needs.determine_environment.result == 'success'
-    
+
+    env:
+      # Core settings from determine_environment
+      ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
+     
+      # AWS configuration
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+   
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 📥 Download All Artifacts
+      - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: 📊 Create GitHub Step Summary
+      - name: Create GitHub Step Summary
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
           TEST_PROFILES: ${{ needs.determine_environment.outputs.test_profiles }}
         run: |
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          # 🚀 Energy Forecasting MLOps Deployment Summary
+          # Energy Forecasting MLOps Deployment Summary
 
-          ## 📋 Deployment Configuration
+          ## Deployment Configuration
           | Parameter | Value |
           |-----------|-------|
           | **Environment** | `${{ env.ENVIRONMENT }}` |
@@ -560,7 +875,7 @@ jobs:
           | **GitHub Run ID** | `${{ github.run_id }}` |
           | **Deployment Time** | `$(date '+%Y-%m-%d %H:%M:%S UTC')` |
 
-          ## 🎯 Job Results Summary
+          ## Job Results Summary
           | Job | Status | Duration | Details |
           |-----|--------|----------|---------|
           | Environment Setup | ${{ needs.determine_environment.result }} | N/A | Configuration and validation |
@@ -571,38 +886,38 @@ jobs:
           | Integration Validation | ${{ needs.validate_integration.result }} | N/A | End-to-end pipeline validation |
           | Cost Optimization | ${{ needs.cleanup_resources.result || 'Skipped' }} | N/A | Test resource cleanup |
 
-          ## 🏗️ Infrastructure Deployed
+          ## Infrastructure Deployed
           - **11 Lambda Functions** - Model registry, endpoint management, profile processing
           - **2 Step Functions** - Training pipeline (sequential), Prediction pipeline (parallel)
           - **2 EventBridge Rules** - Monthly training, daily predictions (disabled by default)
           - **3 ECR Repositories** - Preprocessing, training, prediction containers
           - **Cost Optimization** - Delete/recreate endpoint strategy
 
-          ## 🎯 Testing Strategy Results
+          ## Testing Strategy Results
           ### Training Pipeline (Sequential)
           - **Architecture**: All 7 profiles in single SageMaker job
           - **Execution**: Sequential processing within job
           - **Result**: ${{ needs.test_training.result || 'Skipped' }}
 
-          ### Prediction Pipeline (Parallel) 
+          ### Prediction Pipeline (Parallel)
           - **Architecture**: Step Functions Map state with MaxConcurrency: 7
           - **Test Cases**: Single profile, subset, all profiles
           - **Cost Optimization**: Endpoints created → predictions → automatic cleanup
           - **Result**: ${{ needs.test_prediction.result || 'Skipped' }}
 
-          ## 💰 Cost Optimization Features
+          ## Cost Optimization Features
           - **Endpoint Strategy**: Create → Use → Delete (98% cost savings vs always-on)
           - **Container Builds**: CodeBuild integration with fallback to local Docker
           - **S3 Data Preservation**: All training data and models preserved
           - **Cleanup Status**: ${{ needs.cleanup_resources.result || 'Skipped' }}
 
-          ## 🔍 Key Performance Indicators
+          ## Key Performance Indicators
           - **Profiles Supported**: 7 (RNN, RN, M, S, AGR, L, A6)
           - **Parallel Execution**: Up to 7 endpoints simultaneously
           - **Fault Tolerance**: Individual profile error isolation
           - **Environment Support**: Dev, Pre-prod, Production ready
 
-          ## 📂 Deployment Artifacts
+          ## Deployment Artifacts
           All deployment artifacts have been uploaded and are available for 30-90 days:
           - Container build summaries
           - Deployment configuration files  
@@ -610,7 +925,7 @@ jobs:
           - Integration validation reports
           - Cost optimization summaries
 
-          ## 🔄 Next Steps
+          ## Next Steps
           ### For Dev Environment:
           - Review test results and performance metrics
           - Iterate on model improvements
@@ -621,7 +936,7 @@ jobs:
           - Monitor cost optimization effectiveness
           - Set up CloudWatch dashboards and alarms
 
-          ## 🆘 Troubleshooting
+          ## Troubleshooting
           If any job failed, check:
           1. AWS permissions and role assumptions
           2. S3 bucket accessibility and data availability
@@ -633,12 +948,12 @@ jobs:
           *Generated by GitHub Actions • Run ID: ${{ github.run_id }} • $(date)*
           EOF
 
-      - name: 📊 Create Comprehensive Deployment Report
+      - name: Create Comprehensive Deployment Report
         env:
           ENVIRONMENT: ${{ needs.determine_environment.outputs.environment }}
         run: |
           cat > comprehensive-deployment-report.md << 'EOF'
-          # 🚀 Energy Forecasting MLOps - Complete Deployment Report
+          # Energy Forecasting MLOps - Complete Deployment Report
 
           ## Executive Summary
           This report provides a comprehensive overview of the Energy Forecasting MLOps pipeline deployment to the `${{ env.ENVIRONMENT }}` environment.
@@ -708,7 +1023,7 @@ jobs:
           ## Environment Configuration
           Environment: ${{ env.ENVIRONMENT }}
           Region: us-west-2
-          Account: ${{ vars.AWS_ACCOUNT_ID }}
+          Account: $AWS_ACCOUNT_ID
           Pipeline: ${{ needs.determine_environment.outputs.pipeline_name }}
 
           ## Recommendations
@@ -728,7 +1043,7 @@ jobs:
           GitHub Run ID: ${{ github.run_id }}
           EOF
 
-      - name: 📝 Upload Comprehensive Report
+      - name: Upload Comprehensive Report
         uses: actions/upload-artifact@v4
         with:
           name: comprehensive-deployment-report-${{ needs.determine_environment.outputs.environment }}-${{ github.run_id }}
